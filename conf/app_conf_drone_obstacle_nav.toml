@@ -1,0 +1,7 @@
+[drone_obstacle_nav]
+rl_helper = "kaiwudrl.server.aisrv.kaiwu_rl_helper_standard.KaiWuRLStandardHelper"
+probs_handler = "tools.action_space_drone_obstacle_nav.DumpProbs"
+
+[drone_obstacle_nav.policies.train_one]
+policy_builder = "kaiwudrl.server.aisrv.async_policy.AsyncBuilder"
+algo = "ppo"

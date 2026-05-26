@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: UTF-8 -*-
+###########################################################################
+# Copyright 1998 - 2026 Tencent. All Rights Reserved.
+###########################################################################
+"""
+Author: Tencent AI Arena Authors
+
+PPO hyperparameters and model configuration for Drone Obstacle Navigation.
+"""
+
+
+class Config:
+    # Fixed task dimensions.
+    TASK_NAME = "ObstacleHover"
+    OBS_DIM = 95
+    ACTION_DIM = 4
+    MAX_WAYPOINTS = 8
+    OBSTACLE_FEATURE_DIM = 32
+    TIME_ENCODING_DIM = 4
+
+    # Training hyperparameters.
+    LEARNING_RATE = 0.0005
+    CLIP_PARAM = 0.1
+    GAMMA = 0.995
+    LAM = 0.95
+    VALUE_LOSS_COEF = 0.5
+    ENTROPY_COEF = 0.001
+    MAX_GRAD_NORM = 10.0
+
+    # Training schedule.
+    NUM_LEARNING_EPOCHS = 4
+    NUM_MINI_BATCHES = 16
+    NUM_STEPS_PER_ENV = 64
+    MODEL_SAVE_INTERVAL_SEC = 180
+
+    # Model architecture.
+    ACTOR_HIDDEN_DIMS = [256, 128, 64]
+    CRITIC_HIDDEN_DIMS = [256, 128, 64]
+    ACTIVATION = "elu"
+    INIT_NOISE_STD = 1.0
+    FIXED_STD = False
+
+    # Reward coefficients.
+    REWARD_DISTANCE_SCALE = 0.6
+    DISTANCE_REWARD_MULTIPLIER = 6.0
+    GOAL_REACHED_REWARD = 100.0
+    IN_ARENA_REWARD = 0.0
+    OUT_OF_ARENA_PENALTY = 100.0
+
+    # Hierarchical control switches.
+    USE_HIERARCHICAL = True
+    DIRECT_GOAL_MODE = False
+    STRAIGHT_LINE_MODE = False
+    HOVER_TEST = False
+    PARAM_TEST = False
+
+    # Controller parameters.
+    KP_POS = 0.3
+    KP_VEL_XY = 0.2
+    KP_VEL_Z = 0.3
+    MAX_XY_VEL = 0.8
+    MAX_Z_VEL = 0.5
+    MAX_TILT_RATE = 0.2
+    HOVER_BASE_THRUST = 0.0671
+    POS_KP_XY = 0.10
+    POS_KP_Z = 0.15
+    MAX_XY_RATE = 0.25
+    MAX_TILT_ANGLE = 0.06
+
+    RISE_POS_KP_XY = 0.0
+    RISE_VEL_DAMP_XY = 0.12
+    RISE_DESIRED_VZ_GAIN = 0.45
+    RISE_THRUST_KP = 0.70
+    RISE_MAX_VZ = 0.55
+    RISE_MAX_TILT_ANGLE = 0.02
+    RISE_TO_HOVER_Z_THRESH = 0.10
+
+    HOVER_STABLE_Z_THRESH = 0.10
+    HOVER_POS_KP_XY = 0.20
+    HOVER_VEL_DAMP_XY = 0.22
+    HOVER_MAX_TILT_ANGLE = 0.08
+    HOVER_DESIRED_VZ_GAIN = 0.20
+    HOVER_THRUST_KP = 0.45
+    HOVER_MAX_VZ = 0.25
+    HOVER_MAX_XY_SPEED = 0.25
+    HOVER_ENTRY_HOLD_FRAMES = 45
+    HOVER_UNSTABLE_MIN_FRAMES = 15
+    HOVER_STABLE_XY_SPEED = 0.45
+    HOVER_BYPASS_DIST_XY = float("inf")
+
+    ACTION_ROLL_SIGN = -1.0
+    ACTION_PITCH_SIGN = -1.0
+    ACTION_YAW_SIGN = 1.0
+
+    FLY_DESIRED_VZ_GAIN = 0.22
+    FLY_THRUST_KP = 0.45
+    FLY_MAX_VZ = 0.40
+    FLY_POS_KP_XY = 0.35
+    FLY_MAX_XY_SPEED = 0.80
+    FLY_BRAKE_DIST_XY = 1.20
+    FLY_BRAKE_DECEL = 1.80
+    FLY_BRAKE_REVERSE_GAIN = 0.90
+    FLY_BRAKE_MAX_TILT_ANGLE = 0.10
+
+    RISE_MAX_XY_SPEED = 0.05
+
+    HOVER_BRAKE_DIST_XY = 0.60
+    HOVER_BRAKE_DECEL = 1.40
+    HOVER_BRAKE_REVERSE_GAIN = 1.10
+    HOVER_BRAKE_MAX_TILT_ANGLE = 0.12
+
+    BRAKE_DEADBAND_DIST_XY = 0.08
+    BRAKE_MAX_REVERSE_SPEED = 0.35
+
+    ROUTE_WP_REACHED_DIST_XY = 0.15
+    ROUTE_WP_REACHED_DIST_Z = 0.15
+    ROUTE_WP_REACHED_SPEED_XY = 0.12
+
+    GOAL_HOVER_DIST_XY = 0.18
+    GOAL_HOVER_DIST_Z = 0.18
+    GOAL_HOVER_SPEED_XY = 0.15
+
+    # Velocity controller.
+    VC_KP_XY = 0.8
+    VC_KP_Z = 1.0
+    VC_HOVER_OFFSET = 0.0
+    VC_MAX_ROLL_PITCH = 0.5
+
+    # Potential field planner.
+    PF_ATTRACTIVE_GAIN = 1.0
+    PF_REPULSIVE_GAIN = 1.5
+    PF_REPULSIVE_RANGE = 0.5
+    PF_DAMPING_GAIN = 0.8
+    PF_MAX_VELOCITY = 0.5
+    PF_BOUNDARY_REPULSIVE_GAIN = 2.0
+    PF_BOUNDARY_MARGIN = 0.3
+
+    # Emergency safety.
+    SAFETY_RADIUS = 0.25
+    EMERGENCY_BACKWARD_SPEED = 1.5
+    EMERGENCY_CLIMB_SPEED = 1.0
+
+    # Arena bounds.
+    ARENA_X_MIN = 0.0
+    ARENA_X_MAX = 5.0
+    ARENA_Y_MIN = 0.0
+    ARENA_Y_MAX = 5.0
+    ARENA_Z_MIN = 0.1
+    ARENA_Z_MAX = 3.0
+
+    # Action format.
+    MOTOR_MIXING_MODE = False
+
+    # Observation layout (95D).
+    OBS_IDX_TARGET_RPOS = [0, 1, 2]
+    OBS_IDX_OBSTACLE_RPOS_START = 3
+    OBS_IDX_LINEAR_VELOCITY = [27, 28, 29]
+    OBS_IDX_ANGULAR_VELOCITY = [30, 31, 32]
+    OBS_IDX_ROTATION_MATRIX_START = 33
+    OBS_IDX_HOVER_TIMER = 42
+    OBS_IDX_OBSTACLE_RADII_START = 43
+    OBS_IDX_START_RPOS = [51, 52, 53]
+    OBS_IDX_GOAL_RPOS = [54, 55, 56]
+    OBS_IDX_PHASE_ONEHOT = [57, 58]
+    OBS_IDX_WAYPOINT_RPOS_START = 59
+    OBS_IDX_WAYPOINT_VISITED_START = 83
+    OBS_IDX_TIME_ENCODING = [91, 92, 93, 94]
+    OBSTACLE_MAX_COUNT = 8
