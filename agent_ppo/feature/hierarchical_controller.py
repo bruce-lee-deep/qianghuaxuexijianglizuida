@@ -45,7 +45,10 @@ class HierarchicalController:
         self._wp_phase = None
         self._hover_timer = None
         self._hover_ref_target_rpos = None
+        self._hover_ref_yaw = None
         self._wp_from_fly = None
+        self._align_timer = None
+        self._level_timer = None
 
         L = self.logger.info if self.logger else print
         L(
@@ -109,6 +112,135 @@ class HierarchicalController:
         xy_norm = torch.norm(xy_vec, dim=-1, keepdim=True)
         scale = torch.clamp(max_speed / torch.clamp(xy_norm, min=1.0e-6), max=1.0)
         return xy_vec * scale
+
+    @staticmethod
+    def _make_zero_roll(action: torch.Tensor) -> torch.Tensor:
+        action = action.clone()
+        action[:, 0] = 0.0
+        return action
+
+    def _compute_yaw_rate(self, yaw_error: torch.Tensor, max_rate: float = None) -> torch.Tensor:
+        max_rate = max_rate if max_rate is not None else getattr(Config, "ALIGN_YAW_RATE_MAX", 0.30)
+        kp = getattr(Config, "ALIGN_YAW_RATE_KP", 1.20)
+        return torch.clamp(-kp * yaw_error, -max_rate, max_rate)
+
+    @staticmethod
+    def _heading_from_xy(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(getattr(Config, "HEADING_Y_SIGN", -1.0) * y, x)
+
+    def _compute_vertical_thrust(
+        self,
+        current_roll: torch.Tensor,
+        current_pitch: torch.Tensor,
+        vz: torch.Tensor,
+        target_z: torch.Tensor,
+        desired_vz_gain: float,
+        max_vz: float,
+        thrust_kp: float,
+    ):
+        desired_vz = torch.clamp(desired_vz_gain * target_z, -max_vz, max_vz)
+        vz_err = desired_vz - vz
+        thrust = Config.HOVER_BASE_THRUST + thrust_kp * vz_err
+        tilt_angle = torch.sqrt(current_roll**2 + current_pitch**2 + 1.0e-8)
+        thrust = thrust / torch.clamp(torch.cos(tilt_angle), 0.7, 1.0)
+        thrust = torch.clamp(thrust, -0.25, 0.25)
+        return thrust, desired_vz, vz_err
+
+    def _compute_level_pitch_rate(self, current_pitch: torch.Tensor, current_vy_body: torch.Tensor) -> torch.Tensor:
+        desired_pitch = torch.clamp(
+            0.15 * current_vy_body,
+            -getattr(Config, "LEVEL_PITCH_THRESH", 0.035),
+            getattr(Config, "LEVEL_PITCH_THRESH", 0.035),
+        )
+        return torch.clamp(
+            getattr(Config, "LEVEL_PITCH_RATE_KP", 2.80) * (desired_pitch - current_pitch),
+            -getattr(Config, "LEVEL_PITCH_RATE_MAX", 0.25),
+            getattr(Config, "LEVEL_PITCH_RATE_MAX", 0.25),
+        )
+
+    def _compute_rise_level_pitch_rate(
+        self,
+        current_pitch: torch.Tensor,
+        current_vx_body: torch.Tensor,
+        current_vy_body: torch.Tensor,
+    ) -> torch.Tensor:
+        desired_pitch = torch.clamp(
+            0.08 * current_vy_body,
+            -getattr(Config, "LEVEL_PITCH_THRESH", 0.035),
+            getattr(Config, "LEVEL_PITCH_THRESH", 0.035),
+        )
+        pitch_rate = getattr(Config, "LEVEL_PITCH_RATE_KP", 2.80) * (desired_pitch - current_pitch)
+        # Add mild damping against residual forward motion so rise behaves closer to in-place vertical motion.
+        pitch_rate = pitch_rate - 0.10 * current_vx_body
+        return torch.clamp(
+            pitch_rate,
+            -getattr(Config, "RISE_LEVEL_PITCH_RATE_MAX", 0.20),
+            getattr(Config, "RISE_LEVEL_PITCH_RATE_MAX", 0.20),
+        )
+
+    def _compute_brake_level_pitch_rate(
+        self,
+        current_pitch: torch.Tensor,
+        current_vx_body: torch.Tensor,
+        current_vy_body: torch.Tensor,
+    ) -> torch.Tensor:
+        desired_pitch = torch.clamp(
+            getattr(Config, "BRAKE_LEVEL_VX_PITCH_KP", 0.55) * current_vx_body
+            + getattr(Config, "BRAKE_LEVEL_VY_PITCH_KP", 0.18) * current_vy_body,
+            -getattr(Config, "BRAKE_LEVEL_MAX_PITCH_ANGLE", 0.10),
+            getattr(Config, "BRAKE_LEVEL_MAX_PITCH_ANGLE", 0.10),
+        )
+        return torch.clamp(
+            getattr(Config, "BRAKE_LEVEL_PITCH_RATE_KP", 2.20) * (desired_pitch - current_pitch),
+            -getattr(Config, "BRAKE_LEVEL_MAX_PITCH_RATE", 0.20),
+            getattr(Config, "BRAKE_LEVEL_MAX_PITCH_RATE", 0.20),
+        )
+
+    def _compute_waypoint_brake_action(self, parsed):
+        rotation = parsed.rotation_matrix
+        current_roll, current_pitch, current_yaw = self._extract_attitude(rotation)
+        v_body = parsed.linear_velocity
+        vx_b = v_body[:, 0]
+        vy_b = v_body[:, 1]
+        vz = v_body[:, 2]
+        hover_xy_speed = torch.sqrt(vx_b**2 + vy_b**2)
+        yaw_error = self._wrap_angle(self._hover_ref_yaw - current_yaw)
+        yaw_rate = torch.clamp(
+            -getattr(Config, "ALIGN_YAW_RATE_KP", 1.20) * yaw_error,
+            -getattr(Config, "BRAKE_LEVEL_YAW_RATE_MAX", 0.10),
+            getattr(Config, "BRAKE_LEVEL_YAW_RATE_MAX", 0.10),
+        )
+        pitch_rate = self._compute_brake_level_pitch_rate(current_pitch, vx_b, vy_b)
+        thrust, desired_vz, vz_err = self._compute_vertical_thrust(
+            current_roll,
+            current_pitch,
+            vz,
+            torch.zeros_like(vz),
+            0.0,
+            getattr(Config, "HOVER_MAX_VZ", 0.25),
+            getattr(Config, "BRAKE_LEVEL_HOVER_THRUST_KP", 0.35),
+        )
+
+        action = torch.zeros(parsed.batch_size, 4, device=parsed.device)
+        action[:, 1] = pitch_rate
+        action[:, 2] = yaw_rate
+        action[:, 3] = thrust
+        action = self._make_zero_roll(action)
+
+        debug = {
+            "yaw_error": yaw_error,
+            "desired_vz": desired_vz,
+            "vz_err": vz_err,
+            "vx_b": vx_b,
+            "vy_b": vy_b,
+            "vz": vz,
+            "hover_xy_speed": hover_xy_speed,
+            "current_roll": current_roll,
+            "current_pitch": current_pitch,
+            "pitch_rate_cmd_sem": pitch_rate,
+            "roll_rate_cmd_sem": action[:, 0],
+        }
+        return action, debug
 
     def _compute_braked_desired_vxy(
         self,
@@ -176,7 +308,10 @@ class HierarchicalController:
         self._wp_phase[env_mask] = 0
         self._hover_timer[env_mask] = 0
         self._hover_ref_target_rpos[env_mask].zero_()
+        self._hover_ref_yaw[env_mask] = 0.0
         self._wp_from_fly[env_mask] = False
+        self._align_timer[env_mask] = 0
+        self._level_timer[env_mask] = 0
 
     def _compute_action_param_test(self, obs) -> torch.Tensor:
         obs, original_shape = self._prepare_obs(obs)
@@ -303,10 +438,10 @@ class HierarchicalController:
         v_world = torch.bmm(rotation, v_body.unsqueeze(-1)).squeeze(-1)
         hover_xy_speed = torch.sqrt(vx_b**2 + vy_b**2)
 
-        target_heading = torch.atan2(ty, tx)
+        target_heading = self._heading_from_xy(tx, ty)
         yaw_error = self._wrap_angle(target_heading - current_yaw)
         if phase == "fly":
-            vel_heading = torch.atan2(v_world[:, 1], v_world[:, 0])
+            vel_heading = self._heading_from_xy(v_world[:, 0], v_world[:, 1])
             yaw_error_fly = self._wrap_angle(vel_heading - current_yaw)
             yaw_rate = torch.clamp(-0.8 * yaw_error_fly, -0.25, 0.25)
         elif phase == "hover":
@@ -464,6 +599,9 @@ class HierarchicalController:
         pitch_rate = torch.clamp(k_rate * (d_pitch - current_pitch), -0.3, 0.3)
 
         action = torch.stack([roll_rate, pitch_rate, yaw_rate, thrust], dim=-1)
+        if getattr(Config, "FORCE_ZERO_ROLL", False):
+            action = self._make_zero_roll(action)
+            roll_rate = action[:, 0]
         debug = {
             "tx": tx,
             "ty": ty,
@@ -534,25 +672,71 @@ class HierarchicalController:
         完成后过渡到悬停阶段（或跳过悬停直接平飞）。
         Returns: (action, debug_dict)
         """
-        action, debug = self._compute_tracking_action(parsed, target_rpos, phase="rise")
-
-        rise_yaw_ok = debug["yaw_error"].abs() < 0.05
-        h_ok = debug["tz"].abs() < Config.RISE_TO_HOVER_Z_THRESH
-        overshot = debug["tz"] < -0.10
-        rise_ready = mask & rise_yaw_ok & (h_ok | overshot)
-        bypass_hover = rise_ready & (
-            debug["dist_xy"] > getattr(Config, "HOVER_BYPASS_DIST_XY", float("inf"))
+        rotation = parsed.rotation_matrix
+        current_roll, current_pitch, current_yaw = self._extract_attitude(rotation)
+        v_body = parsed.linear_velocity
+        vx_b = v_body[:, 0]
+        vy_b = v_body[:, 1]
+        hover_xy_speed = torch.sqrt(vx_b**2 + vy_b**2)
+        tx = target_rpos[:, 0]
+        ty = target_rpos[:, 1]
+        tz = target_rpos[:, 2]
+        dist_xy = torch.norm(target_rpos[:, :2], dim=-1)
+        target_heading = self._heading_from_xy(tx, ty)
+        yaw_error = self._wrap_angle(target_heading - current_yaw)
+        yaw_rate = self._compute_yaw_rate(yaw_error)
+        pitch_rate = self._compute_rise_level_pitch_rate(current_pitch, vx_b, vy_b)
+        thrust, desired_vz, vz_err = self._compute_vertical_thrust(
+            current_roll,
+            current_pitch,
+            v_body[:, 2],
+            tz,
+            Config.RISE_DESIRED_VZ_GAIN,
+            Config.RISE_MAX_VZ,
+            Config.RISE_THRUST_KP,
         )
-        self._wp_phase[bypass_hover] = 2
-        self._hover_timer[bypass_hover] = 0
-        self._hover_ref_target_rpos[bypass_hover].zero_()
 
-        to_hover = rise_ready & (~bypass_hover)
-        self._wp_phase[to_hover] = 1
-        self._hover_timer[to_hover] = getattr(Config, "HOVER_ENTRY_HOLD_FRAMES", 125)
-        self._hover_ref_target_rpos[to_hover] = target_rpos[to_hover]
+        action = torch.zeros(parsed.batch_size, 4, device=parsed.device)
+        action[:, 1] = pitch_rate
+        action[:, 2] = yaw_rate
+        action[:, 3] = thrust
+        action = self._make_zero_roll(action)
 
-        return action, debug
+        yaw_ok = yaw_error.abs() < getattr(Config, "ALIGN_YAW_THRESH", 0.06)
+        z_ok = tz.abs() < getattr(Config, "ALIGN_Z_THRESH", Config.RISE_TO_HOVER_Z_THRESH)
+        xy_speed_ok = hover_xy_speed < getattr(Config, "ALIGN_XY_SPEED_THRESH", 0.10)
+        pitch_ok = current_pitch.abs() < getattr(Config, "LEVEL_PITCH_THRESH", 0.035)
+        ready = mask & yaw_ok & z_ok & xy_speed_ok & pitch_ok
+        self._align_timer[mask & (~ready)] = 0
+        self._align_timer[ready] += 1
+
+        to_fly = ready & (self._align_timer >= getattr(Config, "ALIGN_HOLD_FRAMES", 8))
+        self._wp_phase[to_fly] = 2
+        self._align_timer[to_fly] = 0
+        self._hover_timer[to_fly] = 0
+        self._hover_ref_target_rpos[to_fly] = target_rpos[to_fly]
+
+        debug = {
+            "tx": tx,
+            "ty": ty,
+            "tz": tz,
+            "dist_xy": dist_xy,
+            "yaw_error": yaw_error,
+            "desired_vz": desired_vz,
+            "vz_err": vz_err,
+            "vx_b": vx_b,
+            "vy_b": vy_b,
+            "vz": v_body[:, 2],
+            "hover_xy_speed": hover_xy_speed,
+            "current_roll": current_roll,
+            "current_pitch": current_pitch,
+            "pitch_level_ok": pitch_ok,
+            "level_xy_speed_ok": xy_speed_ok,
+            "pitch_rate_cmd_sem": pitch_rate,
+            "roll_rate_cmd_sem": action[:, 0],
+            "align_frames": self._align_timer.clone(),
+        }
+        return self._apply_action_axis_signs(action), debug
 
     def _phase_hover(self, parsed, target_rpos, mask):
         """阶段2：悬停0.9s，稳定姿态。
@@ -560,38 +744,65 @@ class HierarchicalController:
         完成后过渡到平飞阶段。
         Returns: (action, debug_dict)
         """
-        action, debug = self._compute_tracking_action(
-            parsed,
-            target_rpos,
-            phase="hover",
-            hover_ref_target_rpos=self._hover_ref_target_rpos,
-        )
+        batch_size = parsed.batch_size
+        device = parsed.device
+        brake_action, brake_debug = self._compute_waypoint_brake_action(parsed)
+        action = torch.zeros(batch_size, 4, device=device)
+        action[mask] = brake_action[mask]
+        tx = target_rpos[:, 0]
+        ty = target_rpos[:, 1]
+        tz = target_rpos[:, 2]
+        dist_xy = torch.norm(target_rpos[:, :2], dim=-1)
 
-        self._hover_timer[mask] -= 1
-        hover_yaw_ok = debug["yaw_error"].abs() < 0.05
-        hover_xy_ok = debug["hover_xy_speed"] < getattr(
-            Config, "HOVER_STABLE_XY_SPEED", float("inf")
-        )
-        stable_hover = (
+        pitch_ok = brake_debug["current_pitch"].abs() < getattr(Config, "LEVEL_PITCH_THRESH", 0.035)
+        roll_ok = brake_debug["current_roll"].abs() < getattr(Config, "LEVEL_ROLL_THRESH", 0.035)
+        xy_speed_ok = brake_debug["hover_xy_speed"] < getattr(Config, "LEVEL_XY_SPEED_THRESH", 0.10)
+        yaw_ok = brake_debug["yaw_error"].abs() < getattr(Config, "ALIGN_YAW_THRESH", 0.06)
+        z_speed_ok = brake_debug["vz"].abs() < getattr(Config, "HOVER_STABLE_Z_THRESH", 0.10)
+        level_ready = mask & pitch_ok & roll_ok & xy_speed_ok & yaw_ok & z_speed_ok
+        self._level_timer[mask & (~level_ready)] = 0
+        self._level_timer[level_ready] += 1
+
+        action = self._make_zero_roll(action)
+
+        self._hover_timer[mask] = torch.clamp(self._hover_timer[mask] - 1, min=0)
+        brake_done = (
             mask
-            & hover_yaw_ok
-            & (debug["tz"].abs() < Config.HOVER_STABLE_Z_THRESH)
-            & hover_xy_ok
+            & self._wp_from_fly
+            & (self._level_timer >= getattr(Config, "LEVEL_HOLD_FRAMES", 10))
+            & (self._hover_timer <= 0)
         )
-        unstable_hover = mask & (~stable_hover) & (~self._wp_from_fly)
-        self._hover_timer[unstable_hover] = torch.clamp(
-            self._hover_timer[unstable_hover],
-            min=getattr(Config, "HOVER_UNSTABLE_MIN_FRAMES", 60),
-        )
-        brake_done = self._wp_from_fly & (self._hover_timer <= 0)
         self._wp_phase[brake_done] = 0
         self._wp_from_fly[brake_done] = False
+        self._level_timer[brake_done] = 0
 
-        to_fly = stable_hover & (self._hover_timer <= 0) & (~self._wp_from_fly)
-        self._wp_phase[to_fly] = 2
-
-        debug["hover_xy_stable"] = hover_xy_ok
-        return action, debug
+        debug = {
+            "tx": tx,
+            "ty": ty,
+            "tz": tz,
+            "dist_xy": dist_xy,
+            "yaw_error": brake_debug["yaw_error"],
+            "desired_vz": brake_debug["desired_vz"],
+            "vz_err": brake_debug["vz_err"],
+            "vx_b": brake_debug["vx_b"],
+            "vy_b": brake_debug["vy_b"],
+            "vz": brake_debug["vz"],
+            "hover_xy_speed": brake_debug["hover_xy_speed"],
+            "current_roll": brake_debug["current_roll"],
+            "current_pitch": brake_debug["current_pitch"],
+            "hover_error_body_x": torch.zeros_like(tx),
+            "hover_error_body_y": torch.zeros_like(ty),
+            "d_roll_hover": torch.zeros_like(tx),
+            "d_pitch_hover": torch.zeros_like(tx),
+            "roll_rate_cmd_sem": brake_debug["roll_rate_cmd_sem"],
+            "pitch_rate_cmd_sem": brake_debug["pitch_rate_cmd_sem"],
+            "hover_xy_stable": xy_speed_ok,
+            "pitch_level_ok": pitch_ok,
+            "roll_level_ok": roll_ok,
+            "level_xy_speed_ok": xy_speed_ok,
+            "level_frames": self._level_timer.clone(),
+        }
+        return self._apply_action_axis_signs(action), debug
 
     def _phase_fly(self, parsed, target_rpos, mask):
         """阶段3：控制飞机平飞到终点。
@@ -599,10 +810,69 @@ class HierarchicalController:
         到达终点后过渡到最终悬停；到达中间航点则前进到下一航点。
         Returns: (action, debug_dict)
         """
-        action, debug = self._compute_tracking_action(parsed, target_rpos, phase="fly")
-
         batch_size = parsed.batch_size
         device = parsed.device
+        rotation = parsed.rotation_matrix
+        current_roll, current_pitch, current_yaw = self._extract_attitude(rotation)
+        v_body = parsed.linear_velocity
+        v_world = torch.bmm(rotation, v_body.unsqueeze(-1)).squeeze(-1)
+        tx = target_rpos[:, 0]
+        ty = target_rpos[:, 1]
+        tz = target_rpos[:, 2]
+        dist_xy = torch.norm(target_rpos[:, :2], dim=-1)
+        target_heading = self._heading_from_xy(tx, ty)
+        yaw_error = self._wrap_angle(target_heading - current_yaw)
+        yaw_rate = self._compute_yaw_rate(yaw_error)
+        dir_xy = target_rpos[:, :2] / torch.clamp(dist_xy.unsqueeze(-1), min=1.0e-6)
+        radial_speed = torch.sum(v_world[:, :2] * dir_xy, dim=-1)
+        (
+            desired_vxy,
+            brake_active,
+            radial_speed_to_target,
+            brake_speed_cap,
+            stopping_dist_xy,
+            desired_speed_xy,
+        ) = self._compute_braked_desired_vxy(
+            target_rpos[:, :2],
+            v_world[:, :2],
+            getattr(Config, "NO_ROLL_FWD_SPEED_KP", 0.55),
+            getattr(Config, "NO_ROLL_FWD_SPEED_MAX", getattr(Config, "FLY_MAX_XY_SPEED", 0.8)),
+            getattr(Config, "FLY_BRAKE_DIST_XY", 1.2),
+            getattr(Config, "FLY_BRAKE_DECEL", 1.8),
+            getattr(Config, "FLY_BRAKE_REVERSE_GAIN", 0.9),
+        )
+        desired_forward_speed = torch.sum(desired_vxy * dir_xy, dim=-1)
+        forward_vel_body = v_body[:, 0]
+        desired_pitch = torch.where(
+            brake_active,
+            -getattr(Config, "NO_ROLL_BRAKE_PITCH_KP", 0.85) * (desired_forward_speed - forward_vel_body),
+            -getattr(Config, "NO_ROLL_CRUISE_PITCH_KP", 0.60) * (desired_forward_speed - forward_vel_body),
+        )
+        desired_pitch = desired_pitch + getattr(Config, "NO_ROLL_LATERAL_VEL_DAMP", 0.60) * v_body[:, 1]
+        desired_pitch = torch.clamp(
+            desired_pitch,
+            -getattr(Config, "NO_ROLL_MAX_PITCH_ANGLE", 0.16),
+            getattr(Config, "NO_ROLL_MAX_PITCH_ANGLE", 0.16),
+        )
+        pitch_rate = torch.clamp(
+            getattr(Config, "NO_ROLL_PITCH_RATE_KP", 2.40) * (desired_pitch - current_pitch),
+            -getattr(Config, "NO_ROLL_MAX_PITCH_RATE", 0.35),
+            getattr(Config, "NO_ROLL_MAX_PITCH_RATE", 0.35),
+        )
+        thrust, desired_vz, vz_err = self._compute_vertical_thrust(
+            current_roll,
+            current_pitch,
+            v_body[:, 2],
+            tz,
+            getattr(Config, "FLY_DESIRED_VZ_GAIN", 0.22),
+            getattr(Config, "FLY_MAX_VZ", 0.40),
+            getattr(Config, "FLY_THRUST_KP", 0.45),
+        )
+        action = torch.zeros(batch_size, 4, device=device)
+        action[:, 1] = pitch_rate
+        action[:, 2] = yaw_rate
+        action[:, 3] = thrust
+        action = self._make_zero_roll(action)
 
         is_goal_target = torch.zeros(batch_size, dtype=torch.bool, device=device)
         for b in range(batch_size):
@@ -610,12 +880,12 @@ class HierarchicalController:
             idx = int(self._wp_index[b].item())
             is_goal_target[b] = offsets is None or idx >= len(offsets)
 
-        wp_xy_ok = debug["dist_xy"] < getattr(Config, "ROUTE_WP_REACHED_DIST_XY", 0.3)
-        wp_z_ok = debug["tz"].abs() < getattr(Config, "ROUTE_WP_REACHED_DIST_Z", 0.3)
-        wp_speed_ok = debug["hover_xy_speed"] < getattr(Config, "ROUTE_WP_REACHED_SPEED_XY", 0.2)
-        goal_xy_ok = debug["dist_xy"] < getattr(Config, "GOAL_HOVER_DIST_XY", 0.2)
-        goal_z_ok = debug["tz"].abs() < getattr(Config, "GOAL_HOVER_DIST_Z", 0.2)
-        goal_speed_ok = debug["hover_xy_speed"] < getattr(Config, "GOAL_HOVER_SPEED_XY", 0.15)
+        wp_xy_ok = dist_xy < getattr(Config, "ROUTE_WP_REACHED_DIST_XY", 0.3)
+        wp_z_ok = tz.abs() < getattr(Config, "ROUTE_WP_REACHED_DIST_Z", 0.3)
+        wp_speed_ok = radial_speed.abs() < getattr(Config, "ROUTE_WP_REACHED_SPEED_XY", 0.2)
+        goal_xy_ok = dist_xy < getattr(Config, "GOAL_HOVER_DIST_XY", 0.2)
+        goal_z_ok = tz.abs() < getattr(Config, "GOAL_HOVER_DIST_Z", 0.2)
+        goal_speed_ok = radial_speed.abs() < getattr(Config, "GOAL_HOVER_SPEED_XY", 0.15)
 
         to_final_hover = mask & is_goal_target & goal_xy_ok & goal_z_ok & goal_speed_ok
         self._wp_phase[to_final_hover] = 3
@@ -632,19 +902,56 @@ class HierarchicalController:
                 if idx < len(offsets):
                     self._wp_index[b] = idx + 1
                     self._wp_phase[b] = 1
-                    self._hover_timer[b] = 50
+                    self._hover_timer[b] = getattr(Config, "NO_ROLL_BRAKE_HOLD_FRAMES", 12)
                     self._wp_from_fly[b] = True
                     self._hover_ref_target_rpos[b] = target_rpos[b].clone()
+                    self._hover_ref_yaw[b] = current_yaw[b]
 
-        debug["is_goal_target"] = is_goal_target
-        return action, debug
+        debug = {
+            "tx": tx,
+            "ty": ty,
+            "tz": tz,
+            "dist_xy": dist_xy,
+            "yaw_error": yaw_error,
+            "vx_b": v_body[:, 0],
+            "vy_b": v_body[:, 1],
+            "vz": v_body[:, 2],
+            "hover_xy_speed": torch.norm(v_body[:, :2], dim=-1),
+            "current_roll": current_roll,
+            "current_pitch": current_pitch,
+            "desired_vz": desired_vz,
+            "vz_err": vz_err,
+            "desired_vx_world": desired_vxy[:, 0],
+            "desired_vy_world": desired_vxy[:, 1],
+            "current_vx_world": v_world[:, 0],
+            "current_vy_world": v_world[:, 1],
+            "brake_active": brake_active,
+            "radial_speed_to_target": radial_speed_to_target,
+            "brake_speed_cap": brake_speed_cap,
+            "stopping_dist_xy": stopping_dist_xy,
+            "desired_speed_xy": desired_speed_xy,
+            "roll_rate_cmd_sem": action[:, 0],
+            "pitch_rate_cmd_sem": pitch_rate,
+            "is_goal_target": is_goal_target,
+        }
+        return self._apply_action_axis_signs(action), debug
 
     def _phase_final(self, parsed, target_rpos, mask):
         """阶段4：到终点后悬停3s。无退出过渡，复用悬停控制律。
 
         Returns: (None, debug_dict)
         """
-        return None, {"is_final": mask}
+        action, debug = self._compute_tracking_action(
+            parsed,
+            target_rpos,
+            phase="hover",
+            hover_ref_target_rpos=self._hover_ref_target_rpos,
+        )
+        action = self._make_zero_roll(action)
+        debug["hover_xy_stable"] = debug["hover_xy_speed"] < getattr(
+            Config, "HOVER_STABLE_XY_SPEED", float("inf")
+        )
+        return action, debug
 
     def _compute_action_full(self, obs) -> torch.Tensor:
         obs, original_shape = self._prepare_obs(obs)
@@ -663,16 +970,21 @@ class HierarchicalController:
             if self._custom_wp_offsets is not None:
                 self._wp_offsets[b] = list(self._custom_wp_offsets)
             else:
-                waypoints = []
                 g = parsed.goal_rpos[b]
-                for i in range(8):
-                    if parsed.waypoint_active[b, i] and not parsed.waypoint_visited[b, i]:
-                        waypoints.append(parsed.waypoint_rpos[b, i])
-
-                waypoints.sort(key=lambda w: (w**2).sum().item())
-
                 waypoint_offsets = []
-                for wp in waypoints:
+                if not self._direct_goal_mode:
+                    ordered_targets, lengths = self.waypoint_seq.plan(
+                        torch.zeros(1, 3, dtype=torch.float32, device=device),
+                        parsed.waypoint_rpos[b : b + 1],
+                        parsed.waypoint_visited[b : b + 1],
+                        parsed.waypoint_active[b : b + 1],
+                        parsed.goal_rpos[b : b + 1],
+                    )
+                    ordered_waypoints = ordered_targets[0, : max(int(lengths[0].item()) - 1, 0)]
+                else:
+                    ordered_waypoints = torch.zeros(0, 3, dtype=torch.float32, device=device)
+
+                for wp in ordered_waypoints:
                     waypoint_offsets.append(
                         [(wp[0] - g[0]).item(), (wp[1] - g[1]).item(), (wp[2] - g[2]).item()]
                     )
@@ -682,6 +994,9 @@ class HierarchicalController:
             self._wp_phase[b] = 0
             self._hover_timer[b] = 0
             self._hover_ref_target_rpos[b].zero_()
+            self._hover_ref_yaw[b] = 0.0
+            self._align_timer[b] = 0
+            self._level_timer[b] = 0
 
             if b == 0:
                 n = len(self._wp_offsets[b])
@@ -726,24 +1041,24 @@ class HierarchicalController:
         action_rise, rise_debug = self._phase_rise(parsed, target_rpos, mask_rise)
         action_hover, hover_debug = self._phase_hover(parsed, target_rpos, mask_hover)
         action_fly, fly_debug = self._phase_fly(parsed, target_rpos, mask_fly)
-        _, final_debug = self._phase_final(parsed, target_rpos, mask_final)
+        action_final, final_debug = self._phase_final(parsed, target_rpos, mask_final)
 
         action = torch.where(
             mask_fly.unsqueeze(-1),
             action_fly,
-            torch.where((mask_hover | mask_final).unsqueeze(-1), action_hover, action_rise),
+            torch.where(mask_final.unsqueeze(-1), action_final, torch.where(mask_hover.unsqueeze(-1), action_hover, action_rise)),
         )
 
         if not hasattr(self, "_full_fc"):
             self._full_fc = 0
         self._full_fc += 1
         if self._full_fc <= 15 or self._full_fc % 30 == 0:
-            phase_names = {0: "RISE", 1: "HOVER", 2: "FLY", 3: "FINAL"}
+            phase_names = {0: "RISE", 1: "BRAKE", 2: "FLY", 3: "FINAL"}
             b0 = 0
             wp_idx = int(self._wp_index[b0].item())
             n_wp = len(self._wp_offsets[b0]) if self._wp_offsets[b0] else 0
             p = int(self._wp_phase[b0].item())
-            phase_debug = {0: rise_debug, 1: hover_debug, 2: fly_debug, 3: hover_debug}.get(p, fly_debug)
+            phase_debug = {0: rise_debug, 1: hover_debug, 2: fly_debug, 3: final_debug}.get(p, fly_debug)
             msg = (
                 f">>> 航路飞行 f{self._full_fc} [{phase_names.get(p, '?')}] "
                 f"wp={wp_idx}/{n_wp} "
@@ -754,18 +1069,18 @@ class HierarchicalController:
             )
             if p in (1, 3):
                 msg += (
-                    f" hover_err_b=({hover_debug['hover_error_body_x'][b0]:+.2f},"
-                    f"{hover_debug['hover_error_body_y'][b0]:+.2f}) "
-                    f"v_b=({hover_debug['vx_b'][b0]:+.2f},{hover_debug['vy_b'][b0]:+.2f},"
-                    f"{hover_debug['vz'][b0]:+.2f}) "
-                    f"xy_v={hover_debug['hover_xy_speed'][b0]:.2f} "
-                    f"stable_xy={int(hover_debug['hover_xy_stable'][b0].item())} "
-                    f"att=({hover_debug['current_roll'][b0]:+.2f},"
-                    f"{hover_debug['current_pitch'][b0]:+.2f}) "
-                    f"rr_sem={hover_debug['roll_rate_cmd_sem'][b0]:+.2f} "
-                    f"pr_sem={hover_debug['pitch_rate_cmd_sem'][b0]:+.2f} "
-                    f"d_hover=({hover_debug['d_roll_hover'][b0]:+.2f},"
-                    f"{hover_debug['d_pitch_hover'][b0]:+.2f})"
+                    f" hover_err_b=({phase_debug['hover_error_body_x'][b0]:+.2f},"
+                    f"{phase_debug['hover_error_body_y'][b0]:+.2f}) "
+                    f"v_b=({phase_debug['vx_b'][b0]:+.2f},{phase_debug['vy_b'][b0]:+.2f},"
+                    f"{phase_debug['vz'][b0]:+.2f}) "
+                    f"xy_v={phase_debug['hover_xy_speed'][b0]:.2f} "
+                    f"stable_xy={int(phase_debug['hover_xy_stable'][b0].item())} "
+                    f"att=({phase_debug['current_roll'][b0]:+.2f},"
+                    f"{phase_debug['current_pitch'][b0]:+.2f}) "
+                    f"rr_sem={phase_debug['roll_rate_cmd_sem'][b0]:+.2f} "
+                    f"pr_sem={phase_debug['pitch_rate_cmd_sem'][b0]:+.2f} "
+                    f"d_hover=({phase_debug['d_roll_hover'][b0]:+.2f},"
+                    f"{phase_debug['d_pitch_hover'][b0]:+.2f})"
                 )
             elif p == 2:
                 msg += (
@@ -892,7 +1207,10 @@ class HierarchicalController:
         self._wp_phase = torch.zeros(batch_size, dtype=torch.long, device=device)
         self._hover_timer = torch.zeros(batch_size, dtype=torch.long, device=device)
         self._hover_ref_target_rpos = torch.zeros(batch_size, 3, dtype=torch.float32, device=device)
+        self._hover_ref_yaw = torch.zeros(batch_size, dtype=torch.float32, device=device)
         self._wp_from_fly = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        self._align_timer = torch.zeros(batch_size, dtype=torch.long, device=device)
+        self._level_timer = torch.zeros(batch_size, dtype=torch.long, device=device)
 
     def reset(self, batch_size: int = None, device: torch.device = None):
         if batch_size is not None and device is not None:
@@ -905,7 +1223,10 @@ class HierarchicalController:
             self._wp_phase = None
             self._hover_timer = None
             self._hover_ref_target_rpos = None
+            self._hover_ref_yaw = None
             self._wp_from_fly = None
+            self._align_timer = None
+            self._level_timer = None
 
 
 __all__ = ["HierarchicalController"]
