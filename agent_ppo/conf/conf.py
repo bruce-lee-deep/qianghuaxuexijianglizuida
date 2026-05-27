@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: UTF-8 -*-
-###########################################################################
-# Copyright 1998 - 2026 Tencent. All Rights Reserved.
-###########################################################################
-"""
-Author: Tencent AI Arena Authors
-
-PPO hyperparameters and model configuration for Drone Obstacle Navigation.
-"""
-
-
 class Config:
     # Fixed task dimensions.
     TASK_NAME = "ObstacleHover"
@@ -92,7 +80,7 @@ class Config:
     ACTION_ROLL_SIGN = -1.0
     ACTION_PITCH_SIGN = -1.0
     ACTION_YAW_SIGN = 1.0
-    FORCE_ZERO_ROLL = True
+    FORCE_ZERO_ROLL = False
     HEADING_Y_SIGN = -1.0
 
     ALIGN_YAW_THRESH = 0.06
@@ -100,22 +88,12 @@ class Config:
     ALIGN_YAW_RATE_KP = 1.20
     ALIGN_YAW_RATE_MAX = 0.30
     ALIGN_HOLD_FRAMES = 8
-    ALIGN_XY_SPEED_THRESH = 0.10
-    LEVEL_PITCH_THRESH = 0.035
-    LEVEL_ROLL_THRESH = 0.035
-    LEVEL_XY_SPEED_THRESH = 0.10
-    LEVEL_HOLD_FRAMES = 10
-    LEVEL_PITCH_RATE_KP = 2.80
-    LEVEL_PITCH_RATE_MAX = 0.25
-    LEVEL_YAW_RATE_MAX = 0.12
-    RISE_LEVEL_PITCH_RATE_MAX = 0.20
-    BRAKE_LEVEL_VX_PITCH_KP = 0.55
-    BRAKE_LEVEL_VY_PITCH_KP = 0.18
-    BRAKE_LEVEL_MAX_PITCH_ANGLE = 0.10
-    BRAKE_LEVEL_PITCH_RATE_KP = 2.20
-    BRAKE_LEVEL_MAX_PITCH_RATE = 0.20
-    BRAKE_LEVEL_YAW_RATE_MAX = 0.10
-    BRAKE_LEVEL_HOVER_THRUST_KP = 0.35
+
+    # RISE pitch leveling (拉平俯仰，pitch/yaw 分离约束)
+    LEVEL_PITCH_THRESH = 0.01
+    LEVEL_PITCH_KP = 1.5
+    LEVEL_PITCH_RATE_THRESH = 0.01
+    LEVEL_XY_SPEED_THRESH = 0.02
 
     NO_ROLL_CRUISE_PITCH_KP = 0.60
     NO_ROLL_BRAKE_PITCH_KP = 0.85
@@ -158,8 +136,14 @@ class Config:
     # Velocity controller.
     VC_KP_XY = 0.8
     VC_KP_Z = 1.0
-    VC_HOVER_OFFSET = 0.0
+    VC_HOVER_OFFSET = HOVER_BASE_THRUST
     VC_MAX_ROLL_PITCH = 0.5
+    VC_THRUST_MIN = -0.25
+    VC_THRUST_MAX = 0.25
+    VC_YAW_RATE_FLY_KP = 0.8
+    VC_YAW_RATE_HOVER_KP = 0.5
+    VC_YAW_RATE_FLY_MAX = 0.25
+    VC_YAW_RATE_HOVER_MAX = 0.15
 
     # Potential field planner.
     PF_ATTRACTIVE_GAIN = 1.0
@@ -169,11 +153,16 @@ class Config:
     PF_MAX_VELOCITY = 0.5
     PF_BOUNDARY_REPULSIVE_GAIN = 2.0
     PF_BOUNDARY_MARGIN = 0.3
+    PF_BLEND = 0.35
+    PF_LOCAL_BOUNDARY_EXTENT = 100.0
 
     # Emergency safety.
     SAFETY_RADIUS = 0.25
     EMERGENCY_BACKWARD_SPEED = 1.5
     EMERGENCY_CLIMB_SPEED = 1.0
+    ENABLE_OBSTACLE_AVOIDANCE = True
+    DESIRED_VEL_SLEW_XY = 0.12
+    DESIRED_VEL_SLEW_Z = 0.10
 
     # Arena bounds.
     ARENA_X_MIN = 0.0
