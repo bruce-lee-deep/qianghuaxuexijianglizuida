@@ -47,7 +47,6 @@ class HierarchicalController:
         self._hover_ref_target_rpos = None
         self._wp_from_fly = None
         self._align_timer = None
-        self._prev_desired_velocity = None
 
         L = self.logger.info if self.logger else print
         L(
@@ -117,146 +116,6 @@ class HierarchicalController:
         action = action.clone()
         action[:, 0] = 0.0
         return action
-
-    def _smooth_desired_velocity(
-        self,
-        desired_velocity: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if self._prev_desired_velocity is None:
-            return desired_velocity
-
-        prev = self._prev_desired_velocity[mask]
-        current = desired_velocity[mask]
-        delta = current - prev
-
-        max_xy_step = getattr(Config, "DESIRED_VEL_SLEW_XY", float("inf"))
-        max_z_step = getattr(Config, "DESIRED_VEL_SLEW_Z", float("inf"))
-
-        if math.isfinite(max_xy_step):
-            xy_delta = delta[:, :2]
-            xy_norm = torch.norm(xy_delta, dim=-1, keepdim=True)
-            xy_scale = torch.clamp(max_xy_step / torch.clamp(xy_norm, min=1.0e-6), max=1.0)
-            delta[:, :2] = xy_delta * xy_scale
-
-        if math.isfinite(max_z_step):
-            delta[:, 2] = torch.clamp(delta[:, 2], -max_z_step, max_z_step)
-
-        smoothed = prev + delta
-        self._prev_desired_velocity[mask] = smoothed
-        desired_velocity = desired_velocity.clone()
-        desired_velocity[mask] = smoothed
-        return desired_velocity
-
-    def _compute_phase_desired_velocity(self, target_rpos, v_world, phase: str):
-        dist_xy = torch.norm(target_rpos[:, :2], dim=-1)
-        tz = target_rpos[:, 2]
-
-        if phase == "fly":
-            max_xy_speed = getattr(Config, "FLY_MAX_XY_SPEED", Config.MAX_XY_VEL)
-            phase_kp_xy = getattr(Config, "FLY_POS_KP_XY", Config.KP_POS)
-            brake_dist = getattr(Config, "FLY_BRAKE_DIST_XY", 1.0)
-            brake_decel = getattr(Config, "FLY_BRAKE_DECEL", 1.5)
-            brake_reverse_gain = getattr(Config, "FLY_BRAKE_REVERSE_GAIN", 0.8)
-            max_vz = getattr(Config, "FLY_MAX_VZ", 0.3)
-            desired_vz_gain = getattr(Config, "FLY_DESIRED_VZ_GAIN", 0.15)
-        elif phase == "hover":
-            max_xy_speed = getattr(Config, "HOVER_MAX_XY_SPEED", 0.25)
-            phase_kp_xy = Config.HOVER_POS_KP_XY
-            brake_dist = getattr(Config, "HOVER_BRAKE_DIST_XY", 0.5)
-            brake_decel = getattr(Config, "HOVER_BRAKE_DECEL", 1.2)
-            brake_reverse_gain = getattr(Config, "HOVER_BRAKE_REVERSE_GAIN", 1.0)
-            max_vz = Config.HOVER_MAX_VZ
-            desired_vz_gain = Config.HOVER_DESIRED_VZ_GAIN
-        else:
-            max_xy_speed = getattr(Config, "RISE_MAX_XY_SPEED", 0.0)
-            phase_kp_xy = Config.RISE_POS_KP_XY
-            brake_dist = 0.0
-            brake_decel = 1.0
-            brake_reverse_gain = 0.0
-            max_vz = Config.RISE_MAX_VZ
-            desired_vz_gain = Config.RISE_DESIRED_VZ_GAIN
-
-        if phase in ("fly", "hover"):
-            (
-                desired_vxy,
-                brake_active,
-                radial_speed_to_target,
-                brake_speed_cap,
-                stopping_dist_xy,
-                desired_speed_xy,
-            ) = self._compute_braked_desired_vxy(
-                target_rpos[:, :2],
-                v_world[:, :2],
-                phase_kp_xy,
-                max_xy_speed,
-                brake_dist,
-                brake_decel,
-                brake_reverse_gain,
-            )
-        else:
-            desired_vxy = self._clip_xy_vector(phase_kp_xy * target_rpos[:, :2], max_xy_speed)
-            brake_active = torch.zeros_like(dist_xy, dtype=torch.bool)
-            radial_speed_to_target = torch.zeros_like(dist_xy)
-            brake_speed_cap = torch.zeros_like(dist_xy)
-            stopping_dist_xy = torch.zeros_like(dist_xy)
-            desired_speed_xy = torch.norm(desired_vxy, dim=-1)
-
-        desired_vz = torch.clamp(desired_vz_gain * tz, -max_vz, max_vz)
-        desired_velocity = torch.cat([desired_vxy, desired_vz.unsqueeze(-1)], dim=-1)
-        return desired_velocity, {
-            "brake_active": brake_active,
-            "radial_speed_to_target": radial_speed_to_target,
-            "brake_speed_cap": brake_speed_cap,
-            "stopping_dist_xy": stopping_dist_xy,
-            "desired_speed_xy": desired_speed_xy,
-            "desired_vz": desired_vz,
-        }
-
-    def _apply_obstacle_avoidance(self, parsed, v_world, target_rpos, desired_velocity):
-        if not getattr(Config, "ENABLE_OBSTACLE_AVOIDANCE", True):
-            return desired_velocity, torch.zeros_like(desired_velocity), torch.zeros(
-                parsed.batch_size, dtype=torch.bool, device=parsed.device
-            )
-
-        local_drone_pos = torch.zeros_like(target_rpos)
-        local_bounds = {
-            "x_min": -getattr(Config, "PF_LOCAL_BOUNDARY_EXTENT", 100.0),
-            "x_max": getattr(Config, "PF_LOCAL_BOUNDARY_EXTENT", 100.0),
-            "y_min": -getattr(Config, "PF_LOCAL_BOUNDARY_EXTENT", 100.0),
-            "y_max": getattr(Config, "PF_LOCAL_BOUNDARY_EXTENT", 100.0),
-            "z_min": -getattr(Config, "PF_LOCAL_BOUNDARY_EXTENT", 100.0),
-            "z_max": getattr(Config, "PF_LOCAL_BOUNDARY_EXTENT", 100.0),
-        }
-        avoid_velocity = self.planner.compute_desired_velocity(
-            local_drone_pos,
-            v_world,
-            target_rpos,
-            parsed.obstacle_rpos[:, :, :2],
-            parsed.obstacle_radius,
-            parsed.obstacle_active,
-            local_bounds,
-        )
-        blend = getattr(Config, "PF_BLEND", 0.35)
-        blended = (1.0 - blend) * desired_velocity + blend * avoid_velocity
-
-        emergency = self.planner.check_emergency(
-            local_drone_pos,
-            parsed.obstacle_rpos[:, :, :2],
-            parsed.obstacle_radius,
-            parsed.obstacle_active,
-        )
-        if emergency.any():
-            emergency_vel, _ = self.planner.emergency_action(
-                local_drone_pos,
-                v_world,
-                parsed.obstacle_rpos[:, :, :2],
-                parsed.obstacle_radius,
-                parsed.obstacle_active,
-            )
-            blended = torch.where(emergency.unsqueeze(-1), emergency_vel, blended)
-
-        return blended, avoid_velocity, emergency
 
     def _compute_yaw_rate(self, yaw_error: torch.Tensor, max_rate: float = None) -> torch.Tensor:
         max_rate = max_rate if max_rate is not None else getattr(Config, "ALIGN_YAW_RATE_MAX", 0.30)
@@ -353,7 +212,6 @@ class HierarchicalController:
         self._hover_ref_target_rpos[env_mask].zero_()
         self._wp_from_fly[env_mask] = False
         self._align_timer[env_mask] = 0
-        self._prev_desired_velocity[env_mask].zero_()
 
     def _compute_action_param_test(self, obs) -> torch.Tensor:
         obs, original_shape = self._prepare_obs(obs)
@@ -422,13 +280,7 @@ class HierarchicalController:
         parsed = self.parser.parse(obs)
 
         target_rpos = parsed.target_rpos
-        all_mask = torch.ones(parsed.batch_size, dtype=torch.bool, device=parsed.device)
-        action, debug = self._compute_tracking_action(
-            parsed,
-            target_rpos,
-            phase="fly",
-            active_mask=all_mask,
-        )
+        action, debug = self._compute_tracking_action(parsed, target_rpos, phase="fly")
 
         if not hasattr(self, "_sl_fc"):
             self._sl_fc = 0
@@ -471,14 +323,7 @@ class HierarchicalController:
 
         return self._restore_shape(action, original_shape)
 
-    def _compute_tracking_action(
-        self,
-        parsed,
-        target_rpos,
-        phase: str,
-        hover_ref_target_rpos=None,
-        active_mask=None,
-    ):
+    def _compute_tracking_action(self, parsed, target_rpos, phase: str, hover_ref_target_rpos=None):
         tx = target_rpos[:, 0]
         ty = target_rpos[:, 1]
         tz = target_rpos[:, 2]
@@ -496,53 +341,167 @@ class HierarchicalController:
         target_heading = self._heading_from_xy(tx, ty)
         yaw_error = self._wrap_angle(target_heading - current_yaw)
         if phase == "fly":
-            yaw_rate = torch.clamp(
-                -getattr(Config, "VC_YAW_RATE_FLY_KP", 0.8) * yaw_error,
-                -getattr(Config, "VC_YAW_RATE_FLY_MAX", 0.25),
-                getattr(Config, "VC_YAW_RATE_FLY_MAX", 0.25),
-            )
+            vel_heading = self._heading_from_xy(v_world[:, 0], v_world[:, 1])
+            yaw_error_fly = self._wrap_angle(vel_heading - current_yaw)
+            yaw_rate = torch.clamp(-0.8 * yaw_error_fly, -0.25, 0.25)
         elif phase == "hover":
-            yaw_rate = torch.clamp(
-                -getattr(Config, "VC_YAW_RATE_HOVER_KP", 0.5) * yaw_error,
-                -getattr(Config, "VC_YAW_RATE_HOVER_MAX", 0.15),
-                getattr(Config, "VC_YAW_RATE_HOVER_MAX", 0.15),
+            yaw_rate = torch.clamp(-0.5 * yaw_error, -0.15, 0.15)
+        else:
+            yaw_rate = torch.clamp(-0.8 * yaw_error, -0.25, 0.25)
+
+        max_a = Config.MAX_TILT_ANGLE
+        rise_max_a = min(max_a, getattr(Config, "RISE_MAX_TILT_ANGLE", max_a))
+        hover_max_a = min(max_a, getattr(Config, "HOVER_MAX_TILT_ANGLE", max_a))
+
+        if phase == "fly":
+            max_xy_speed = getattr(Config, "FLY_MAX_XY_SPEED", Config.MAX_XY_VEL)
+            phase_kp_xy = getattr(Config, "FLY_POS_KP_XY", Config.KP_POS)
+            brake_dist = getattr(Config, "FLY_BRAKE_DIST_XY", 1.0)
+            brake_decel = getattr(Config, "FLY_BRAKE_DECEL", 1.5)
+            brake_reverse_gain = getattr(Config, "FLY_BRAKE_REVERSE_GAIN", 0.8)
+            base_max_tilt = max_a
+            brake_max_tilt = max(
+                base_max_tilt,
+                getattr(Config, "FLY_BRAKE_MAX_TILT_ANGLE", base_max_tilt),
+            )
+            desired_vz = torch.clamp(
+                getattr(Config, "FLY_DESIRED_VZ_GAIN", 0.15) * tz,
+                -getattr(Config, "FLY_MAX_VZ", 0.3),
+                getattr(Config, "FLY_MAX_VZ", 0.3),
+            )
+            thrust_kp = getattr(Config, "FLY_THRUST_KP", 0.35)
+        elif phase == "hover":
+            max_xy_speed = getattr(Config, "HOVER_MAX_XY_SPEED", 0.25)
+            phase_kp_xy = Config.HOVER_POS_KP_XY
+            brake_dist = getattr(Config, "HOVER_BRAKE_DIST_XY", 0.5)
+            brake_decel = getattr(Config, "HOVER_BRAKE_DECEL", 1.2)
+            brake_reverse_gain = getattr(Config, "HOVER_BRAKE_REVERSE_GAIN", 1.0)
+            base_max_tilt = hover_max_a
+            brake_max_tilt = max(
+                base_max_tilt,
+                getattr(Config, "HOVER_BRAKE_MAX_TILT_ANGLE", base_max_tilt),
+            )
+            desired_vz = torch.clamp(
+                Config.HOVER_DESIRED_VZ_GAIN * tz,
+                -Config.HOVER_MAX_VZ,
+                Config.HOVER_MAX_VZ,
+            )
+            thrust_kp = Config.HOVER_THRUST_KP
+        else:
+            max_xy_speed = getattr(Config, "RISE_MAX_XY_SPEED", 0.0)
+            phase_kp_xy = Config.RISE_POS_KP_XY
+            brake_dist = 0.0
+            brake_decel = 1.0
+            brake_reverse_gain = 0.0
+            base_max_tilt = rise_max_a
+            brake_max_tilt = rise_max_a
+            desired_vxy = self._clip_xy_vector(phase_kp_xy * target_rpos[:, :2], max_xy_speed)
+            desired_vz = torch.clamp(
+                Config.RISE_DESIRED_VZ_GAIN * tz,
+                -Config.RISE_MAX_VZ,
+                Config.RISE_MAX_VZ,
+            )
+            thrust_kp = Config.RISE_THRUST_KP
+
+        if phase in ("fly", "hover"):
+            (
+                desired_vxy,
+                brake_active,
+                radial_speed_to_target,
+                brake_speed_cap,
+                stopping_dist_xy,
+                desired_speed_xy,
+            ) = self._compute_braked_desired_vxy(
+                target_rpos[:, :2],
+                v_world[:, :2],
+                phase_kp_xy,
+                max_xy_speed,
+                brake_dist,
+                brake_decel,
+                brake_reverse_gain,
+            )
+            effective_tilt_limit = torch.where(
+                brake_active,
+                torch.full_like(dist_xy, brake_max_tilt),
+                torch.full_like(dist_xy, base_max_tilt),
             )
         else:
-            yaw_rate = torch.clamp(
-                -getattr(Config, "VC_YAW_RATE_FLY_KP", 0.8) * yaw_error,
-                -getattr(Config, "VC_YAW_RATE_FLY_MAX", 0.25),
-                getattr(Config, "VC_YAW_RATE_FLY_MAX", 0.25),
-            )
+            brake_active = torch.zeros_like(dist_xy, dtype=torch.bool)
+            radial_speed_to_target = torch.zeros_like(dist_xy)
+            brake_speed_cap = torch.zeros_like(dist_xy)
+            stopping_dist_xy = torch.zeros_like(dist_xy)
+            desired_speed_xy = torch.norm(desired_vxy, dim=-1)
+            effective_tilt_limit = torch.full_like(dist_xy, rise_max_a)
 
-        desired_velocity, phase_debug = self._compute_phase_desired_velocity(target_rpos, v_world, phase)
-        desired_velocity_pre_avoid = desired_velocity.clone()
-        desired_velocity, avoid_velocity, emergency = self._apply_obstacle_avoidance(
-            parsed, v_world, target_rpos, desired_velocity
-        )
-        if active_mask is None:
-            phase_mask = torch.ones(parsed.batch_size, dtype=torch.bool, device=parsed.device)
-        else:
-            phase_mask = active_mask
-        desired_velocity = self._smooth_desired_velocity(desired_velocity, phase_mask)
+        desired_velocity = torch.cat([desired_vxy, desired_vz.unsqueeze(-1)], dim=-1)
+        vz_err = desired_vz - vz
+        thrust = Config.HOVER_BASE_THRUST + thrust_kp * vz_err
+        tilt_angle = torch.sqrt(current_roll**2 + current_pitch**2 + 1.0e-8)
+        thrust = thrust / torch.clamp(torch.cos(tilt_angle), 0.7, 1.0)
+        thrust = torch.clamp(thrust, -0.25, 0.25)
 
-        action = self.vel_ctrl.compute_action(
-            v_body,
-            desired_velocity,
-            rotation,
-            takeoff=(phase == "rise"),
-        )
-        action[:, 2] = yaw_rate
-        if getattr(Config, "FORCE_ZERO_ROLL", False):
-            action = self._make_zero_roll(action)
-        roll_rate = action[:, 0]
-        pitch_rate = action[:, 1]
-
+        target_body = torch.bmm(rotation.transpose(1, 2), target_rpos.unsqueeze(-1)).squeeze(-1)
         vel_err_world = desired_velocity - v_world
         vel_err_body = torch.bmm(rotation.transpose(1, 2), vel_err_world.unsqueeze(-1)).squeeze(-1)
-        hover_error_body = torch.bmm(rotation.transpose(1, 2), target_rpos.unsqueeze(-1)).squeeze(-1)
-        target_body = hover_error_body
-        desired_vz = phase_debug["desired_vz"]
-        vz_err = desired_velocity[:, 2] - v_world[:, 2]
+
+        tilt_per_speed = torch.clamp(
+            effective_tilt_limit / max(max_xy_speed, 1.0e-3),
+            max=0.5,
+        )
+
+        d_roll_hold = torch.clamp(
+            tilt_per_speed * vel_err_body[:, 1],
+            -rise_max_a,
+            rise_max_a,
+        )
+        d_pitch_hold = torch.clamp(
+            -tilt_per_speed * vel_err_body[:, 0],
+            -rise_max_a,
+            rise_max_a,
+        )
+
+        d_roll_fly = torch.clamp(
+            tilt_per_speed * vel_err_body[:, 1],
+            -effective_tilt_limit,
+            effective_tilt_limit,
+        )
+        d_pitch_fly = torch.clamp(
+            -tilt_per_speed * vel_err_body[:, 0],
+            -effective_tilt_limit,
+            effective_tilt_limit,
+        )
+
+        hover_error_world = target_rpos
+        hover_error_body = torch.bmm(rotation.transpose(1, 2), hover_error_world.unsqueeze(-1)).squeeze(-1)
+        d_roll_hover = torch.clamp(
+            tilt_per_speed * vel_err_body[:, 1],
+            -effective_tilt_limit,
+            effective_tilt_limit,
+        )
+        d_pitch_hover = torch.clamp(
+            -tilt_per_speed * vel_err_body[:, 0],
+            -effective_tilt_limit,
+            effective_tilt_limit,
+        )
+
+        if phase == "fly":
+            d_roll = d_roll_fly
+            d_pitch = d_pitch_fly
+        elif phase == "hover":
+            d_roll = d_roll_hover
+            d_pitch = d_pitch_hover
+        else:
+            d_roll = torch.zeros_like(current_roll)
+            d_pitch = torch.zeros_like(current_pitch)
+
+        k_rate = 2.0
+        roll_rate = torch.clamp(k_rate * (d_roll - current_roll), -0.3, 0.3)
+        pitch_rate = torch.clamp(k_rate * (d_pitch - current_pitch), -0.3, 0.3)
+
+        action = torch.stack([roll_rate, pitch_rate, yaw_rate, thrust], dim=-1)
+        if getattr(Config, "FORCE_ZERO_ROLL", False):
+            action = self._make_zero_roll(action)
+            roll_rate = action[:, 0]
         debug = {
             "tx": tx,
             "ty": ty,
@@ -559,28 +518,23 @@ class HierarchicalController:
             "vz_err": vz_err,
             "desired_vx_world": desired_velocity[:, 0],
             "desired_vy_world": desired_velocity[:, 1],
-            "track_desired_vx_world": desired_velocity_pre_avoid[:, 0],
-            "track_desired_vy_world": desired_velocity_pre_avoid[:, 1],
-            "avoid_desired_vx_world": avoid_velocity[:, 0],
-            "avoid_desired_vy_world": avoid_velocity[:, 1],
             "current_vx_world": v_world[:, 0],
             "current_vy_world": v_world[:, 1],
-            "brake_active": phase_debug["brake_active"],
-            "radial_speed_to_target": phase_debug["radial_speed_to_target"],
-            "brake_speed_cap": phase_debug["brake_speed_cap"],
-            "stopping_dist_xy": phase_debug["stopping_dist_xy"],
-            "desired_speed_xy": phase_debug["desired_speed_xy"],
+            "brake_active": brake_active,
+            "radial_speed_to_target": radial_speed_to_target,
+            "brake_speed_cap": brake_speed_cap,
+            "stopping_dist_xy": stopping_dist_xy,
+            "desired_speed_xy": desired_speed_xy,
             "vel_err_body_x": vel_err_body[:, 0],
             "vel_err_body_y": vel_err_body[:, 1],
             "hover_error_body_x": hover_error_body[:, 0],
             "hover_error_body_y": hover_error_body[:, 1],
-            "d_roll_hover": roll_rate,
-            "d_pitch_hover": pitch_rate,
+            "d_roll_hover": d_roll_hover,
+            "d_pitch_hover": d_pitch_hover,
             "roll_rate_cmd_sem": roll_rate,
             "pitch_rate_cmd_sem": pitch_rate,
             "target_body_x": target_body[:, 0],
             "target_body_y": target_body[:, 1],
-            "emergency_avoid": emergency,
         }
         return self._apply_action_axis_signs(action), debug
 
@@ -712,8 +666,8 @@ class HierarchicalController:
             target_rpos,
             phase="hover",
             hover_ref_target_rpos=self._hover_ref_target_rpos,
-            active_mask=mask,
         )
+        action = self._make_zero_roll(action)
         # pitch-yaw分离约束：制动悬停不下发yaw
         action[self._wp_from_fly, 2] = 0.0
 
@@ -730,22 +684,73 @@ class HierarchicalController:
         return action, debug
 
     def _phase_fly(self, parsed, target_rpos, mask):
-        """阶段3：统一走速度控制链，跟踪当前目标。"""
-        action, debug = self._compute_tracking_action(
-            parsed,
-            target_rpos,
-            phase="fly",
-            active_mask=mask,
-        )
+        """阶段3：控制飞机平飞到终点。
 
+        到达终点后过渡到最终悬停；到达中间航点则前进到下一航点。
+        Returns: (action, debug_dict)
+        """
         batch_size = parsed.batch_size
         device = parsed.device
+        rotation = parsed.rotation_matrix
+        current_roll, current_pitch, current_yaw = self._extract_attitude(rotation)
         v_body = parsed.linear_velocity
-        v_world = torch.bmm(parsed.rotation_matrix, v_body.unsqueeze(-1)).squeeze(-1)
+        v_world = torch.bmm(rotation, v_body.unsqueeze(-1)).squeeze(-1)
+        tx = target_rpos[:, 0]
+        ty = target_rpos[:, 1]
         tz = target_rpos[:, 2]
         dist_xy = torch.norm(target_rpos[:, :2], dim=-1)
+        target_heading = self._heading_from_xy(tx, ty)
+        yaw_error = self._wrap_angle(target_heading - current_yaw)
         dir_xy = target_rpos[:, :2] / torch.clamp(dist_xy.unsqueeze(-1), min=1.0e-6)
         radial_speed = torch.sum(v_world[:, :2] * dir_xy, dim=-1)
+        (
+            desired_vxy,
+            brake_active,
+            radial_speed_to_target,
+            brake_speed_cap,
+            stopping_dist_xy,
+            desired_speed_xy,
+        ) = self._compute_braked_desired_vxy(
+            target_rpos[:, :2],
+            v_world[:, :2],
+            getattr(Config, "NO_ROLL_FWD_SPEED_KP", 0.55),
+            getattr(Config, "NO_ROLL_FWD_SPEED_MAX", getattr(Config, "FLY_MAX_XY_SPEED", 0.8)),
+            getattr(Config, "FLY_BRAKE_DIST_XY", 1.2),
+            getattr(Config, "FLY_BRAKE_DECEL", 1.8),
+            getattr(Config, "FLY_BRAKE_REVERSE_GAIN", 0.9),
+        )
+        desired_forward_speed = torch.sum(desired_vxy * dir_xy, dim=-1)
+        forward_vel_body = v_body[:, 0]
+        desired_pitch = torch.where(
+            brake_active,
+            -getattr(Config, "NO_ROLL_BRAKE_PITCH_KP", 0.85) * (desired_forward_speed - forward_vel_body),
+            -getattr(Config, "NO_ROLL_CRUISE_PITCH_KP", 0.60) * (desired_forward_speed - forward_vel_body),
+        )
+        desired_pitch = desired_pitch + getattr(Config, "NO_ROLL_LATERAL_VEL_DAMP", 0.60) * v_body[:, 1]
+        desired_pitch = torch.clamp(
+            desired_pitch,
+            -getattr(Config, "NO_ROLL_MAX_PITCH_ANGLE", 0.16),
+            getattr(Config, "NO_ROLL_MAX_PITCH_ANGLE", 0.16),
+        )
+        pitch_rate = torch.clamp(
+            getattr(Config, "NO_ROLL_PITCH_RATE_KP", 2.40) * (desired_pitch - current_pitch),
+            -getattr(Config, "NO_ROLL_MAX_PITCH_RATE", 0.35),
+            getattr(Config, "NO_ROLL_MAX_PITCH_RATE", 0.35),
+        )
+        thrust, desired_vz, vz_err = self._compute_vertical_thrust(
+            current_roll,
+            current_pitch,
+            v_body[:, 2],
+            tz,
+            getattr(Config, "FLY_DESIRED_VZ_GAIN", 0.22),
+            getattr(Config, "FLY_MAX_VZ", 0.40),
+            getattr(Config, "FLY_THRUST_KP", 0.45),
+        )
+        action = torch.zeros(batch_size, 4, device=device)
+        action[:, 1] = pitch_rate
+        action[:, 2] = 0.0  # pitch-yaw分离约束：FLY只用pitch+推力，不调方向
+        action[:, 3] = thrust
+        action = self._make_zero_roll(action)
 
         is_goal_target = torch.zeros(batch_size, dtype=torch.bool, device=device)
         for b in range(batch_size):
@@ -779,9 +784,34 @@ class HierarchicalController:
                     self._wp_from_fly[b] = True
                     self._hover_ref_target_rpos[b] = target_rpos[b].clone()
 
-        debug["is_goal_target"] = is_goal_target
-        debug["hover_xy_speed"] = torch.norm(v_body[:, :2], dim=-1)
-        return action, debug
+        debug = {
+            "tx": tx,
+            "ty": ty,
+            "tz": tz,
+            "dist_xy": dist_xy,
+            "yaw_error": yaw_error,
+            "vx_b": v_body[:, 0],
+            "vy_b": v_body[:, 1],
+            "vz": v_body[:, 2],
+            "hover_xy_speed": torch.norm(v_body[:, :2], dim=-1),
+            "current_roll": current_roll,
+            "current_pitch": current_pitch,
+            "desired_vz": desired_vz,
+            "vz_err": vz_err,
+            "desired_vx_world": desired_vxy[:, 0],
+            "desired_vy_world": desired_vxy[:, 1],
+            "current_vx_world": v_world[:, 0],
+            "current_vy_world": v_world[:, 1],
+            "brake_active": brake_active,
+            "radial_speed_to_target": radial_speed_to_target,
+            "brake_speed_cap": brake_speed_cap,
+            "stopping_dist_xy": stopping_dist_xy,
+            "desired_speed_xy": desired_speed_xy,
+            "roll_rate_cmd_sem": action[:, 0],
+            "pitch_rate_cmd_sem": pitch_rate,
+            "is_goal_target": is_goal_target,
+        }
+        return self._apply_action_axis_signs(action), debug
 
     def _phase_final(self, parsed, target_rpos, mask):
         """阶段4：到终点后悬停3s。无退出过渡，复用悬停控制律。
@@ -793,8 +823,8 @@ class HierarchicalController:
             target_rpos,
             phase="hover",
             hover_ref_target_rpos=self._hover_ref_target_rpos,
-            active_mask=mask,
         )
+        action = self._make_zero_roll(action)
         debug["hover_xy_stable"] = debug["hover_xy_speed"] < getattr(
             Config, "HOVER_STABLE_XY_SPEED", float("inf")
         )
@@ -1054,7 +1084,6 @@ class HierarchicalController:
         self._hover_ref_target_rpos = torch.zeros(batch_size, 3, dtype=torch.float32, device=device)
         self._wp_from_fly = torch.zeros(batch_size, dtype=torch.bool, device=device)
         self._align_timer = torch.zeros(batch_size, dtype=torch.long, device=device)
-        self._prev_desired_velocity = torch.zeros(batch_size, 3, dtype=torch.float32, device=device)
 
     def reset(self, batch_size: int = None, device: torch.device = None):
         if batch_size is not None and device is not None:
@@ -1069,7 +1098,6 @@ class HierarchicalController:
             self._hover_ref_target_rpos = None
             self._wp_from_fly = None
             self._align_timer = None
-            self._prev_desired_velocity = None
 
 
 __all__ = ["HierarchicalController"]
