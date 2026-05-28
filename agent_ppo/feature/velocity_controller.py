@@ -29,8 +29,6 @@ class VelocityController:
     def __init__(self):
         self.kp_xy = Config.VC_KP_XY
         self.kp_z = Config.VC_KP_Z
-        self.thrust_min = getattr(Config, "VC_THRUST_MIN", -1.0)
-        self.thrust_max = getattr(Config, "VC_THRUST_MAX", 1.0)
 
     def compute_action(
         self,
@@ -73,7 +71,7 @@ class VelocityController:
         roll_rate = torch.clamp(roll_rate, -1.0, 1.0)
         pitch_rate = torch.clamp(pitch_rate, -1.0, 1.0)
         yaw_rate = torch.clamp(yaw_rate, -1.0, 1.0)
-        thrust = torch.clamp(thrust, self.thrust_min, self.thrust_max)
+        thrust = torch.clamp(thrust, -1.0, 1.0)
 
         action = torch.stack([roll_rate, pitch_rate, yaw_rate, thrust], dim=-1)
         return action
