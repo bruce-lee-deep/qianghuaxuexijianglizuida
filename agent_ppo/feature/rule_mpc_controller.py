@@ -318,17 +318,10 @@ class RuleMPCController:
         if np.isfinite(z_clip):
             target_guarded[:, 2] = torch.clamp(target_guarded[:, 2], -z_clip, z_clip)
 
-        ghost_dist = float(getattr(Config, "MPC_GHOST_TARGET_DIST", 0.50))
-        ghost_scale = torch.ones(target_guarded.shape[0], device=target_guarded.device, dtype=target_guarded.dtype)
-        ghost_mask = torch.zeros_like(hover_mask, dtype=torch.bool)
-        if np.isfinite(ghost_dist) and ghost_dist > 0.0:
-            target_norm = torch.norm(target_guarded, dim=-1)
-            ghost_mask = (~hover_mask) & (target_norm > ghost_dist)
-            clipped_scale = ghost_dist / target_norm.clamp_min(1.0e-6)
-            ghost_scale = torch.where(ghost_mask, clipped_scale, ghost_scale)
-            target_guarded = target_guarded * ghost_scale.unsqueeze(-1)
-
-        return target_guarded, ghost_scale, ghost_mask
+        xy_scale = torch.ones(target_guarded.shape[0], device=target_guarded.device, dtype=target_guarded.dtype)
+        z_scale = torch.ones_like(xy_scale)
+        high_z_mask = torch.zeros_like(hover_mask, dtype=torch.bool)
+        return target_guarded, xy_scale, z_scale, high_z_mask
 
     def _build_takeoff_profile(self, parsed, hover_mask: torch.Tensor):
         current_up = torch.clamp(-parsed.start_rpos[:, 2], min=0.0)
@@ -392,17 +385,6 @@ class RuleMPCController:
         delta[:, 2] = torch.clamp(delta[:, 2], -z_slew, z_slew)
         return self._prev_u + delta
 
-    def _apply_startup_horizontal_lock(self, accel_cmd: torch.Tensor):
-        lock_steps = max(int(getattr(Config, "MPC_STARTUP_HORIZONTAL_LOCK_STEPS", 30)), 0)
-        if lock_steps <= 0:
-            return accel_cmd, torch.zeros(accel_cmd.shape[0], dtype=torch.bool, device=accel_cmd.device)
-
-        startup_lock_mask = self._startup_counter < lock_steps
-        if startup_lock_mask.any():
-            accel_cmd[startup_lock_mask, 0] = 0.0
-            accel_cmd[startup_lock_mask, 1] = 0.0
-        return accel_cmd, startup_lock_mask
-
     def _build_goal_hover_mask(self, parsed, hover_mask: torch.Tensor, v_world: torch.Tensor):
         goal_xy = torch.norm(parsed.goal_rpos[:, :2], dim=-1)
         goal_z = torch.abs(parsed.goal_rpos[:, 2])
@@ -416,35 +398,31 @@ class RuleMPCController:
     def _map_accel_to_action(
         self,
         accel_cmd_world: torch.Tensor,
+        rotation_matrix: torch.Tensor,
         roll: torch.Tensor,
         pitch: torch.Tensor,
-        yaw: torch.Tensor,
         angular_velocity: torch.Tensor,
         v_world: torch.Tensor,
         hover_mask: torch.Tensor,
         near_goal_mask: torch.Tensor,
+        low_alt_mask: torch.Tensor,
         tilt_limit: torch.Tensor,
     ):
         g = getattr(Config, "MPC_GRAVITY", 9.81)
-        psi = torch.atan2(torch.sin(yaw), torch.cos(yaw))
-        cos_psi = torch.cos(psi)
-        sin_psi = torch.sin(psi)
-
-        ax_body = accel_cmd_world[:, 0] * cos_psi + accel_cmd_world[:, 1] * sin_psi
-        ay_body = -accel_cmd_world[:, 0] * sin_psi + accel_cmd_world[:, 1] * cos_psi
-        accel_cmd_body = torch.stack([ax_body, ay_body, accel_cmd_world[:, 2]], dim=-1)
-
-        cmd_tilt_limit = float(getattr(Config, "MPC_CMD_MAX_TILT_RAD", 0.20))
+        accel_cmd_body = torch.bmm(
+            rotation_matrix.transpose(1, 2),
+            accel_cmd_world.unsqueeze(-1),
+        ).squeeze(-1)
 
         roll_cmd = torch.clamp(
-            -ay_body / g,
-            -cmd_tilt_limit,
-            cmd_tilt_limit,
+            accel_cmd_body[:, 1] / g,
+            -Config.MPC_MAX_ROLL_RAD,
+            Config.MPC_MAX_ROLL_RAD,
         )
         pitch_cmd = torch.clamp(
-            ax_body / g,
-            -cmd_tilt_limit,
-            cmd_tilt_limit,
+            -accel_cmd_body[:, 0] / g,
+            -Config.MPC_MAX_PITCH_RAD,
+            Config.MPC_MAX_PITCH_RAD,
         )
 
         roll_cmd = torch.maximum(torch.minimum(roll_cmd, tilt_limit), -tilt_limit)
@@ -470,11 +448,8 @@ class RuleMPCController:
             vz_damp,
         )
         thrust = thrust - vz_damp * v_world[:, 2]
-
-        min_cos = float(getattr(Config, "MPC_THRUST_COMP_MIN_COS", 0.35))
-        thrust_comp = torch.clamp(torch.cos(roll) * torch.cos(pitch), min=min_cos, max=1.0)
-        accel_comp = (g + accel_cmd_world[:, 2]) / thrust_comp - g
-        thrust = Config.HOVER_BASE_THRUST + Config.MPC_THRUST_GAIN * accel_comp - vz_damp * v_world[:, 2]
+        tilt_angle = torch.sqrt(roll_cmd * roll_cmd + pitch_cmd * pitch_cmd + 1.0e-8)
+        thrust = thrust / torch.clamp(torch.cos(tilt_angle), 0.92, 1.0)
         thrust = torch.clamp(thrust, Config.MPC_THRUST_MIN, Config.MPC_THRUST_MAX)
 
         action = torch.zeros(accel_cmd_world.shape[0], 4, device=accel_cmd_world.device, dtype=torch.float32)
@@ -491,14 +466,14 @@ class RuleMPCController:
 
         rotation = parsed.rotation_matrix
         v_world = torch.bmm(rotation, parsed.linear_velocity.unsqueeze(-1)).squeeze(-1)
-        roll, pitch, yaw = self._extract_attitude(rotation)
+        roll, pitch, _ = self._extract_attitude(rotation)
 
         raw_target_rpos, target_slot, hover_mask = self._select_local_target(parsed)
         near_goal_mask = self._build_goal_hover_mask(parsed, hover_mask, v_world)
         changed_target = target_slot != self._last_target_slot
         self._prev_u[changed_target] = 0.0
         self._wp_hold_counter[changed_target] = 0
-        target_rpos, ghost_scale, ghost_mask = self._apply_startup_guard(raw_target_rpos, hover_mask)
+        target_rpos, xy_scale, z_scale, high_z_mask = self._apply_startup_guard(raw_target_rpos, hover_mask)
         low_alt_mask, strong_takeoff_mask, current_up, xy_accel_limit, tilt_limit, takeoff_progress = (
             self._build_takeoff_profile(parsed, hover_mask)
         )
@@ -533,16 +508,16 @@ class RuleMPCController:
 
         accel_cmd = self._limit_xy_accel(accel_cmd, xy_accel_limit)
         accel_cmd = self._apply_accel_slew_limit(accel_cmd, takeoff_progress)
-        accel_cmd, startup_lock_mask = self._apply_startup_horizontal_lock(accel_cmd)
         action, roll_cmd, pitch_cmd, accel_cmd_body = self._map_accel_to_action(
             accel_cmd,
+            rotation,
             roll,
             pitch,
-            yaw,
             parsed.angular_velocity,
             v_world,
             hover_mask,
             near_goal_mask,
+            low_alt_mask,
             tilt_limit,
         )
         action[:, 3] = action[:, 3] + getattr(Config, "MPC_HOVER_THRUST_BIAS", 0.0)
@@ -571,14 +546,12 @@ class RuleMPCController:
                 f"lock={int(self._locked_target_slot[b0].item())} "
                 f"r_ref=({raw_target_rpos[b0,0]:+.2f},{raw_target_rpos[b0,1]:+.2f},{raw_target_rpos[b0,2]:+.2f}) "
                 f"r_mpc=({target_rpos[b0,0]:+.2f},{target_rpos[b0,1]:+.2f},{target_rpos[b0,2]:+.2f}) "
-                f"ghost={int(ghost_mask[b0].item())} "
-                f"gscale={ghost_scale[b0]:.2f} "
+                f"scale=({xy_scale[b0]:.2f},{z_scale[b0]:.2f}) "
+                f"zgate={int(high_z_mask[b0].item())} "
                 f"up={current_up[b0]:+.2f} "
                 f"lowalt={int(low_alt_mask[b0].item())} "
-                f"lockxy={int(startup_lock_mask[b0].item())} "
                 f"tprog={takeoff_progress[b0]:.2f} "
                 f"gnear={int(near_goal_mask[b0].item())} "
-                f"yaw={float(torch.atan2(torch.sin(yaw[b0]), torch.cos(yaw[b0])).item()):+.2f} "
                 f"v=({v_world[b0,0]:+.2f},{v_world[b0,1]:+.2f},{v_world[b0,2]:+.2f}) "
                 f"a_w=({accel_cmd[b0,0]:+.2f},{accel_cmd[b0,1]:+.2f},{accel_cmd[b0,2]:+.2f}) "
                 f"a_b=({accel_cmd_body[b0,0]:+.2f},{accel_cmd_body[b0,1]:+.2f},{accel_cmd_body[b0,2]:+.2f}) "
