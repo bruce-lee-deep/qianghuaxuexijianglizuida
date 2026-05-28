@@ -206,6 +206,7 @@ class RuleMPCController:
         self._prev_u = None
         self._last_target_slot = None
         self._startup_counter = None
+        self._yaw_align_hold_counter = None
         self._locked_target_slot = None
         self._wp_hold_counter = None
         self._log_counter = 0
@@ -238,6 +239,7 @@ class RuleMPCController:
             self._prev_u = torch.zeros(batch_size, 3, dtype=torch.float32, device=device)
             self._last_target_slot = torch.full((batch_size,), -2, dtype=torch.long, device=device)
             self._startup_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
+            self._yaw_align_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
             self._locked_target_slot = torch.full((batch_size,), -2, dtype=torch.long, device=device)
             self._wp_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
 
@@ -249,6 +251,7 @@ class RuleMPCController:
         self._prev_u[env_mask] = 0.0
         self._last_target_slot[env_mask] = -2
         self._startup_counter[env_mask] = 0
+        self._yaw_align_hold_counter[env_mask] = 0
         self._locked_target_slot[env_mask] = -2
         self._wp_hold_counter[env_mask] = 0
 
@@ -257,12 +260,14 @@ class RuleMPCController:
             self._prev_u = torch.zeros(batch_size, 3, dtype=torch.float32, device=device)
             self._last_target_slot = torch.full((batch_size,), -2, dtype=torch.long, device=device)
             self._startup_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
+            self._yaw_align_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
             self._locked_target_slot = torch.full((batch_size,), -2, dtype=torch.long, device=device)
             self._wp_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
         else:
             self._prev_u = None
             self._last_target_slot = None
             self._startup_counter = None
+            self._yaw_align_hold_counter = None
             self._locked_target_slot = None
             self._wp_hold_counter = None
 
@@ -362,6 +367,54 @@ class RuleMPCController:
         )
         tilt_limit = torch.clamp(tilt_limit, 0.0, float(Config.MPC_MAX_ROLL_RAD))
         return low_alt_mask, strong_takeoff_mask, current_up, xy_accel_limit, tilt_limit, takeoff_progress
+
+    @staticmethod
+    def _wrap_angle(angle: torch.Tensor):
+        return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+    def _build_yaw_align_mask(self, yaw: torch.Tensor, hover_mask: torch.Tensor):
+        if not getattr(Config, "MPC_YAW_ALIGN_ENABLE", True):
+            return torch.zeros_like(hover_mask, dtype=torch.bool), torch.zeros_like(yaw)
+
+        yaw_error = self._wrap_angle(-yaw)
+        aligned = torch.abs(yaw_error) < float(getattr(Config, "MPC_YAW_ALIGN_THRESH", 0.05))
+        self._yaw_align_hold_counter[aligned] += 1
+        self._yaw_align_hold_counter[~aligned] = 0
+
+        min_frames = max(int(getattr(Config, "MPC_YAW_ALIGN_MIN_FRAMES", 45)), 1)
+        max_frames = max(int(getattr(Config, "MPC_YAW_ALIGN_MAX_FRAMES", 90)), min_frames)
+        hold_frames = max(int(getattr(Config, "MPC_YAW_ALIGN_HOLD_FRAMES", 8)), 1)
+
+        need_min_time = self._startup_counter < min_frames
+        need_alignment = (self._startup_counter < max_frames) & (self._yaw_align_hold_counter < hold_frames)
+        align_mask = (~hover_mask) & (need_min_time | need_alignment)
+        return align_mask, yaw_error
+
+    def _apply_yaw_align_profile(
+        self,
+        target_rpos: torch.Tensor,
+        current_up: torch.Tensor,
+        xy_accel_limit: torch.Tensor,
+        tilt_limit: torch.Tensor,
+        align_mask: torch.Tensor,
+    ):
+        if not align_mask.any():
+            return target_rpos, xy_accel_limit, tilt_limit
+
+        target_aligned = target_rpos.clone()
+        desired_up = float(getattr(Config, "MPC_YAW_ALIGN_ALT", 0.30))
+        target_aligned[align_mask, 0] = 0.0
+        target_aligned[align_mask, 1] = 0.0
+        target_aligned[align_mask, 2] = desired_up - current_up[align_mask]
+
+        xy_limit = torch.full_like(xy_accel_limit, float(getattr(Config, "MPC_YAW_ALIGN_XY_ACCEL_LIMIT", 0.08)))
+        xy_accel_limit = torch.where(align_mask, xy_limit, xy_accel_limit)
+
+        align_tilt = torch.full_like(tilt_limit, float(getattr(Config, "MPC_YAW_ALIGN_TILT_RAD", 0.020)))
+        tilt_limit = torch.where(align_mask, align_tilt, tilt_limit)
+
+        self._prev_u[align_mask, :2] = 0.0
+        return target_aligned, xy_accel_limit, tilt_limit
 
     @staticmethod
     def _limit_xy_accel(accel_cmd: torch.Tensor, xy_accel_limit: torch.Tensor):
@@ -466,7 +519,7 @@ class RuleMPCController:
 
         rotation = parsed.rotation_matrix
         v_world = torch.bmm(rotation, parsed.linear_velocity.unsqueeze(-1)).squeeze(-1)
-        roll, pitch, _ = self._extract_attitude(rotation)
+        roll, pitch, yaw = self._extract_attitude(rotation)
 
         raw_target_rpos, target_slot, hover_mask = self._select_local_target(parsed)
         near_goal_mask = self._build_goal_hover_mask(parsed, hover_mask, v_world)
@@ -476,6 +529,14 @@ class RuleMPCController:
         target_rpos, xy_scale, z_scale, high_z_mask = self._apply_startup_guard(raw_target_rpos, hover_mask)
         low_alt_mask, strong_takeoff_mask, current_up, xy_accel_limit, tilt_limit, takeoff_progress = (
             self._build_takeoff_profile(parsed, hover_mask)
+        )
+        yaw_align_mask, yaw_error = self._build_yaw_align_mask(yaw, hover_mask)
+        target_rpos, xy_accel_limit, tilt_limit = self._apply_yaw_align_profile(
+            target_rpos,
+            current_up,
+            xy_accel_limit,
+            tilt_limit,
+            yaw_align_mask,
         )
 
         accel_cmd = torch.zeros(parsed.batch_size, 3, device=parsed.device, dtype=torch.float32)
@@ -507,6 +568,14 @@ class RuleMPCController:
             accel_cmd[b, 2] = z_result.command.to(parsed.device)
 
         accel_cmd = self._limit_xy_accel(accel_cmd, xy_accel_limit)
+        if yaw_align_mask.any():
+            align_alt = float(getattr(Config, "MPC_YAW_ALIGN_ALT", 0.45))
+            min_up_accel = float(getattr(Config, "MPC_YAW_ALIGN_MIN_UP_ACCEL", 0.32))
+            below_align_alt = yaw_align_mask & (current_up < align_alt)
+            accel_cmd[below_align_alt, 2] = torch.maximum(
+                accel_cmd[below_align_alt, 2],
+                torch.full_like(accel_cmd[below_align_alt, 2], min_up_accel),
+            )
         accel_cmd = self._apply_accel_slew_limit(accel_cmd, takeoff_progress)
         action, roll_cmd, pitch_cmd, accel_cmd_body = self._map_accel_to_action(
             accel_cmd,
@@ -525,6 +594,14 @@ class RuleMPCController:
         if goal_hover_bias != 0.0:
             goal_hover_like_mask = hover_mask | near_goal_mask
             action[goal_hover_like_mask, 3] = action[goal_hover_like_mask, 3] + goal_hover_bias
+        if yaw_align_mask.any():
+            yaw_rate = yaw_error * float(getattr(Config, "MPC_YAW_ALIGN_RATE_KP", 1.25))
+            yaw_rate = torch.clamp(
+                yaw_rate,
+                -float(getattr(Config, "MPC_YAW_ALIGN_RATE_MAX", 0.32)),
+                float(getattr(Config, "MPC_YAW_ALIGN_RATE_MAX", 0.32)),
+            )
+            action[yaw_align_mask, 2] = yaw_rate[yaw_align_mask] * getattr(Config, "ACTION_YAW_SIGN", 1.0)
         startup_bias = getattr(Config, "MPC_STARTUP_THRUST_BIAS", 0.0)
         startup_frames = max(int(getattr(Config, "MPC_STARTUP_FRAMES", 1)), 1)
         startup_weight = torch.clamp(1.0 - self._startup_counter.float() / float(startup_frames), 0.0, 1.0)
@@ -550,6 +627,8 @@ class RuleMPCController:
                 f"zgate={int(high_z_mask[b0].item())} "
                 f"up={current_up[b0]:+.2f} "
                 f"lowalt={int(low_alt_mask[b0].item())} "
+                f"yalign={int(yaw_align_mask[b0].item())} "
+                f"yaw={yaw[b0]:+.2f} "
                 f"tprog={takeoff_progress[b0]:.2f} "
                 f"gnear={int(near_goal_mask[b0].item())} "
                 f"v=({v_world[b0,0]:+.2f},{v_world[b0,1]:+.2f},{v_world[b0,2]:+.2f}) "
