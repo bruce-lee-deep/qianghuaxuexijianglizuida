@@ -209,6 +209,9 @@ class RuleMPCController:
         self._yaw_align_hold_counter = None
         self._locked_target_slot = None
         self._wp_hold_counter = None
+        self._avoid_obstacle_slot = None
+        self._avoid_side = None
+        self._avoid_hold_counter = None
         self._log_counter = 0
 
     def _prepare_obs(self, obs):
@@ -242,6 +245,9 @@ class RuleMPCController:
             self._yaw_align_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
             self._locked_target_slot = torch.full((batch_size,), -2, dtype=torch.long, device=device)
             self._wp_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
+            self._avoid_obstacle_slot = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+            self._avoid_side = torch.ones(batch_size, dtype=torch.float32, device=device)
+            self._avoid_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
 
     def reset_envs(self, env_mask: torch.Tensor):
         if self._prev_u is None or env_mask is None:
@@ -254,6 +260,9 @@ class RuleMPCController:
         self._yaw_align_hold_counter[env_mask] = 0
         self._locked_target_slot[env_mask] = -2
         self._wp_hold_counter[env_mask] = 0
+        self._avoid_obstacle_slot[env_mask] = -1
+        self._avoid_side[env_mask] = 1.0
+        self._avoid_hold_counter[env_mask] = 0
 
     def reset(self, batch_size: int = None, device: torch.device = None):
         if batch_size is not None and device is not None:
@@ -263,6 +272,9 @@ class RuleMPCController:
             self._yaw_align_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
             self._locked_target_slot = torch.full((batch_size,), -2, dtype=torch.long, device=device)
             self._wp_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
+            self._avoid_obstacle_slot = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+            self._avoid_side = torch.ones(batch_size, dtype=torch.float32, device=device)
+            self._avoid_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
         else:
             self._prev_u = None
             self._last_target_slot = None
@@ -270,6 +282,9 @@ class RuleMPCController:
             self._yaw_align_hold_counter = None
             self._locked_target_slot = None
             self._wp_hold_counter = None
+            self._avoid_obstacle_slot = None
+            self._avoid_side = None
+            self._avoid_hold_counter = None
 
     def _select_local_target(self, parsed):
         batch_size = parsed.batch_size
@@ -417,6 +432,204 @@ class RuleMPCController:
         return target_aligned, xy_accel_limit, tilt_limit
 
     @staticmethod
+    def _drone_xy_from_start(parsed):
+        start_xy = torch.tensor(
+            [0.5, 2.5],
+            dtype=parsed.start_rpos.dtype,
+            device=parsed.device,
+        )
+        return start_xy.unsqueeze(0) - parsed.start_rpos[:, :2]
+
+    def _score_detour_candidate(
+        self,
+        candidate_xy: torch.Tensor,
+        target_xy: torch.Tensor,
+        obstacle_xy: torch.Tensor,
+        obstacle_radius: torch.Tensor,
+        active_mask: torch.Tensor,
+        chosen_idx: int,
+    ):
+        score = torch.norm(candidate_xy - target_xy).item()
+        for i in active_mask.nonzero(as_tuple=False).view(-1):
+            idx = int(i.item())
+            dist = torch.norm(candidate_xy - obstacle_xy[idx]).item()
+            clearance = float(obstacle_radius[idx].item()) + float(getattr(Config, "OBSTACLE_BASE_MARGIN", 0.26))
+            if idx == chosen_idx:
+                clearance += 0.08
+            if dist < clearance:
+                score += (clearance - dist) * 8.0
+        return score
+
+    def _build_obstacle_avoidance_target(
+        self,
+        parsed,
+        target_rpos: torch.Tensor,
+        hover_mask: torch.Tensor,
+        yaw_align_mask: torch.Tensor,
+        v_world: torch.Tensor,
+    ):
+        avoid_mask = torch.zeros(parsed.batch_size, dtype=torch.bool, device=parsed.device)
+        avoid_slot = torch.full((parsed.batch_size,), -1, dtype=torch.long, device=parsed.device)
+        avoid_side = torch.zeros(parsed.batch_size, dtype=torch.float32, device=parsed.device)
+        if not getattr(Config, "OBSTACLE_AVOID_ENABLE", True):
+            return target_rpos, avoid_mask, avoid_slot, avoid_side
+
+        target_avoid = target_rpos.clone()
+        drone_xy = self._drone_xy_from_start(parsed)
+        wall_margin = float(getattr(Config, "OBSTACLE_WALL_MARGIN", 0.32))
+        arena_min = torch.tensor(
+            [float(Config.ARENA_X_MIN) + wall_margin, float(Config.ARENA_Y_MIN) + wall_margin],
+            dtype=target_rpos.dtype,
+            device=parsed.device,
+        )
+        arena_max = torch.tensor(
+            [float(Config.ARENA_X_MAX) - wall_margin, float(Config.ARENA_Y_MAX) - wall_margin],
+            dtype=target_rpos.dtype,
+            device=parsed.device,
+        )
+
+        lookahead_min = float(getattr(Config, "OBSTACLE_LOOKAHEAD_MIN", 0.05))
+        lookahead_max_cfg = float(getattr(Config, "OBSTACLE_LOOKAHEAD_MAX", 1.35))
+        normal_trigger_min = float(getattr(Config, "OBSTACLE_NORMAL_TRIGGER_MIN", 0.80))
+        base_margin = float(getattr(Config, "OBSTACLE_BASE_MARGIN", 0.26))
+        speed_margin_gain = float(getattr(Config, "OBSTACLE_SPEED_MARGIN_GAIN", 0.08))
+        detour_margin = float(getattr(Config, "OBSTACLE_DETOUR_MARGIN", 0.42))
+        detour_advance = float(getattr(Config, "OBSTACLE_DETOUR_ADVANCE", 0.45))
+        hold_frames = max(int(getattr(Config, "OBSTACLE_AVOID_HOLD_FRAMES", 18)), 1)
+
+        for b in range(parsed.batch_size):
+            if hover_mask[b] or yaw_align_mask[b]:
+                self._avoid_obstacle_slot[b] = -1
+                self._avoid_hold_counter[b] = 0
+                continue
+
+            target_xy = target_rpos[b, :2]
+            target_dist = torch.norm(target_xy).item()
+            if target_dist < 0.15:
+                self._avoid_obstacle_slot[b] = -1
+                self._avoid_hold_counter[b] = 0
+                continue
+
+            direction = target_xy / max(target_dist, 1.0e-6)
+            normal = torch.stack((-direction[1], direction[0]))
+            obstacle_xy = parsed.obstacle_rpos[b, :, :2]
+            obstacle_radius = parsed.obstacle_radius[b]
+            active_mask = parsed.obstacle_active[b]
+            speed_xy = torch.norm(v_world[b, :2]).item()
+            lookahead_max = min(lookahead_max_cfg + 0.20 * speed_xy, max(target_dist - 0.05, lookahead_min))
+
+            best_idx = -1
+            best_score = float("inf")
+            for i in active_mask.nonzero(as_tuple=False).view(-1):
+                idx = int(i.item())
+                obs_xy = obstacle_xy[idx]
+                forward = torch.dot(obs_xy, direction).item()
+                if forward < lookahead_min or forward > lookahead_max:
+                    continue
+
+                lateral_vec = obs_xy - direction * forward
+                lateral = torch.norm(lateral_vec).item()
+                radius = float(obstacle_radius[idx].item())
+                clearance = radius + base_margin + speed_margin_gain * speed_xy
+                if lateral >= clearance:
+                    continue
+
+                normal_zone_bonus = 0.0 if forward >= normal_trigger_min else 0.15
+                penetration = max(clearance - lateral, 0.0)
+                score = forward - 0.45 * penetration + normal_zone_bonus
+                if score < best_score:
+                    best_score = score
+                    best_idx = idx
+
+            if best_idx < 0:
+                self._avoid_obstacle_slot[b] = -1
+                self._avoid_hold_counter[b] = 0
+                continue
+
+            radius = float(obstacle_radius[best_idx].item())
+            detour_offset = radius + detour_margin + speed_margin_gain * speed_xy
+            advance = min(detour_advance + radius * 0.5, 0.75)
+            obs_xy = obstacle_xy[best_idx]
+
+            reuse_side = (
+                int(self._avoid_obstacle_slot[b].item()) == best_idx
+                and int(self._avoid_hold_counter[b].item()) < hold_frames
+            )
+            candidate_sides = [float(self._avoid_side[b].item())] if reuse_side else [1.0, -1.0]
+            best_side = candidate_sides[0]
+            best_candidate = None
+            best_candidate_score = float("inf")
+            for side in candidate_sides:
+                candidate_rel = obs_xy + normal * (side * detour_offset) + direction * advance
+                candidate_abs = torch.clamp(drone_xy[b] + candidate_rel, arena_min, arena_max)
+                candidate_rel = candidate_abs - drone_xy[b]
+                candidate_score = self._score_detour_candidate(
+                    candidate_rel,
+                    target_xy,
+                    obstacle_xy,
+                    obstacle_radius,
+                    active_mask,
+                    best_idx,
+                )
+                if candidate_score < best_candidate_score:
+                    best_candidate_score = candidate_score
+                    best_candidate = candidate_rel
+                    best_side = side
+
+            target_avoid[b, :2] = best_candidate
+            avoid_mask[b] = True
+            avoid_slot[b] = best_idx
+            avoid_side[b] = best_side
+            self._avoid_obstacle_slot[b] = best_idx
+            self._avoid_side[b] = best_side
+            self._avoid_hold_counter[b] = min(int(self._avoid_hold_counter[b].item()) + 1, hold_frames)
+
+        return target_avoid, avoid_mask, avoid_slot, avoid_side
+
+    def _apply_obstacle_safety_accel(
+        self,
+        parsed,
+        accel_cmd: torch.Tensor,
+        hover_mask: torch.Tensor,
+        yaw_align_mask: torch.Tensor,
+        v_world: torch.Tensor,
+    ):
+        emergency_mask = torch.zeros(parsed.batch_size, dtype=torch.bool, device=parsed.device)
+        if not getattr(Config, "OBSTACLE_AVOID_ENABLE", True):
+            return accel_cmd, emergency_mask
+
+        margin = float(getattr(Config, "OBSTACLE_EMERGENCY_MARGIN", 0.24))
+        gain = float(getattr(Config, "OBSTACLE_EMERGENCY_GAIN", 2.2))
+        accel_max = float(getattr(Config, "OBSTACLE_EMERGENCY_ACCEL_MAX", 1.8))
+        adjusted = accel_cmd.clone()
+
+        for b in range(parsed.batch_size):
+            if hover_mask[b] or yaw_align_mask[b]:
+                continue
+
+            repel = torch.zeros(2, dtype=accel_cmd.dtype, device=accel_cmd.device)
+            for i in parsed.obstacle_active[b].nonzero(as_tuple=False).view(-1):
+                idx = int(i.item())
+                obs_xy = parsed.obstacle_rpos[b, idx, :2]
+                dist = torch.norm(obs_xy).item()
+                radius = float(parsed.obstacle_radius[b, idx].item())
+                safe_dist = radius + margin
+                if dist >= safe_dist or dist < 1.0e-4:
+                    continue
+                away = -obs_xy / max(dist, 1.0e-4)
+                closing_speed = max(torch.dot(v_world[b, :2], obs_xy / max(dist, 1.0e-4)).item(), 0.0)
+                strength = gain * (safe_dist - dist) / safe_dist + 0.35 * closing_speed
+                repel += away * strength
+                emergency_mask[b] = True
+
+            repel_norm = torch.norm(repel).item()
+            if repel_norm > accel_max:
+                repel = repel * (accel_max / max(repel_norm, 1.0e-6))
+            adjusted[b, :2] += repel
+
+        return adjusted, emergency_mask
+
+    @staticmethod
     def _limit_xy_accel(accel_cmd: torch.Tensor, xy_accel_limit: torch.Tensor):
         xy = accel_cmd[:, :2]
         xy_norm = torch.norm(xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
@@ -538,6 +751,13 @@ class RuleMPCController:
             tilt_limit,
             yaw_align_mask,
         )
+        target_rpos, avoid_mask, avoid_slot, avoid_side = self._build_obstacle_avoidance_target(
+            parsed,
+            target_rpos,
+            hover_mask,
+            yaw_align_mask,
+            v_world,
+        )
 
         accel_cmd = torch.zeros(parsed.batch_size, 3, device=parsed.device, dtype=torch.float32)
         for b in range(parsed.batch_size):
@@ -567,6 +787,13 @@ class RuleMPCController:
             accel_cmd[b, 1] = y_result.command.to(parsed.device)
             accel_cmd[b, 2] = z_result.command.to(parsed.device)
 
+        accel_cmd, emergency_mask = self._apply_obstacle_safety_accel(
+            parsed,
+            accel_cmd,
+            hover_mask,
+            yaw_align_mask,
+            v_world,
+        )
         accel_cmd = self._limit_xy_accel(accel_cmd, xy_accel_limit)
         if yaw_align_mask.any():
             align_alt = float(getattr(Config, "MPC_YAW_ALIGN_ALT", 0.45))
@@ -629,6 +856,8 @@ class RuleMPCController:
                 f"lowalt={int(low_alt_mask[b0].item())} "
                 f"yalign={int(yaw_align_mask[b0].item())} "
                 f"yaw={yaw[b0]:+.2f} "
+                f"avoid={int(avoid_mask[b0].item())}:{int(avoid_slot[b0].item())}/{float(avoid_side[b0].item()):+.0f} "
+                f"emg={int(emergency_mask[b0].item())} "
                 f"tprog={takeoff_progress[b0]:.2f} "
                 f"gnear={int(near_goal_mask[b0].item())} "
                 f"v=({v_world[b0,0]:+.2f},{v_world[b0,1]:+.2f},{v_world[b0,2]:+.2f}) "
