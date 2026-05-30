@@ -212,6 +212,7 @@ class RuleMPCController:
         self._avoid_obstacle_slot = None
         self._avoid_side = None
         self._avoid_hold_counter = None
+        self._segment_length = None
         self._log_counter = 0
 
     def _prepare_obs(self, obs):
@@ -248,6 +249,7 @@ class RuleMPCController:
             self._avoid_obstacle_slot = torch.full((batch_size,), -1, dtype=torch.long, device=device)
             self._avoid_side = torch.ones(batch_size, dtype=torch.float32, device=device)
             self._avoid_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
+            self._segment_length = torch.zeros(batch_size, dtype=torch.float32, device=device)
 
     def reset_envs(self, env_mask: torch.Tensor):
         if self._prev_u is None or env_mask is None:
@@ -263,6 +265,7 @@ class RuleMPCController:
         self._avoid_obstacle_slot[env_mask] = -1
         self._avoid_side[env_mask] = 1.0
         self._avoid_hold_counter[env_mask] = 0
+        self._segment_length[env_mask] = 0.0
 
     def reset(self, batch_size: int = None, device: torch.device = None):
         if batch_size is not None and device is not None:
@@ -275,6 +278,7 @@ class RuleMPCController:
             self._avoid_obstacle_slot = torch.full((batch_size,), -1, dtype=torch.long, device=device)
             self._avoid_side = torch.ones(batch_size, dtype=torch.float32, device=device)
             self._avoid_hold_counter = torch.zeros(batch_size, dtype=torch.long, device=device)
+            self._segment_length = torch.zeros(batch_size, dtype=torch.float32, device=device)
         else:
             self._prev_u = None
             self._last_target_slot = None
@@ -285,6 +289,47 @@ class RuleMPCController:
             self._avoid_obstacle_slot = None
             self._avoid_side = None
             self._avoid_hold_counter = None
+            self._segment_length = None
+
+    @staticmethod
+    def _segment_clearance_to_targets(
+        obstacle_xy: torch.Tensor,
+        obstacle_radius: torch.Tensor,
+        target_xy: torch.Tensor,
+    ):
+        if target_xy.numel() == 0:
+            return torch.zeros(0, dtype=target_xy.dtype, device=target_xy.device)
+        if obstacle_xy.numel() == 0:
+            return torch.full((target_xy.shape[0],), float("inf"), dtype=target_xy.dtype, device=target_xy.device)
+
+        target_norm_sq = torch.sum(target_xy * target_xy, dim=-1).clamp_min(1.0e-6)
+        proj = obstacle_xy @ target_xy.transpose(0, 1)
+        t = torch.clamp(proj / target_norm_sq.unsqueeze(0), 0.0, 1.0)
+        closest = t.unsqueeze(-1) * target_xy.unsqueeze(0)
+        dist = torch.norm(obstacle_xy.unsqueeze(1) - closest, dim=-1)
+        clearance = dist - obstacle_radius.unsqueeze(-1)
+        return torch.min(clearance, dim=0).values
+
+    def _build_dangerous_segment_mask(self, parsed, target_rpos: torch.Tensor, target_slot: torch.Tensor):
+        danger_mask = torch.zeros(parsed.batch_size, dtype=torch.bool, device=parsed.device)
+        if not getattr(Config, "MPC_DANGER_SEGMENT_ENABLE", True):
+            return danger_mask
+
+        clearance_limit = float(getattr(Config, "MPC_DANGER_SEGMENT_CLEARANCE", 0.35))
+        for b in range(parsed.batch_size):
+            slot = int(target_slot[b].item())
+            if slot < 0:
+                continue
+            active_obs = parsed.obstacle_active[b]
+            if not active_obs.any():
+                continue
+            clearance = self._segment_clearance_to_targets(
+                parsed.obstacle_rpos[b, active_obs, :2],
+                parsed.obstacle_radius[b, active_obs],
+                target_rpos[b : b + 1, :2],
+            )
+            danger_mask[b] = clearance[0] < clearance_limit
+        return danger_mask
 
     def _select_local_target(self, parsed):
         batch_size = parsed.batch_size
@@ -293,7 +338,7 @@ class RuleMPCController:
         target_rpos = parsed.goal_rpos.clone()
         target_slot = torch.full((batch_size,), -1, dtype=torch.long, device=device)
         hover_mask = parsed.phase_hover > 0.5
-        target_rpos[hover_mask] = 0.0
+        target_rpos[hover_mask] = parsed.goal_rpos[hover_mask]
         target_slot[hover_mask] = -99
 
         pending_mask = parsed.waypoint_active & (~parsed.waypoint_visited)
@@ -311,7 +356,24 @@ class RuleMPCController:
 
             pending_points = parsed.waypoint_rpos[b, pending_idx]
             distances = torch.norm(pending_points, dim=-1)
-            best_local = torch.argmin(distances)
+            scores = distances.clone()
+
+            if getattr(Config, "MPC_DANGER_SEGMENT_ENABLE", True) and parsed.obstacle_active[b].any():
+                active_obs = parsed.obstacle_active[b]
+                clearances = self._segment_clearance_to_targets(
+                    parsed.obstacle_rpos[b, active_obs, :2],
+                    parsed.obstacle_radius[b, active_obs],
+                    pending_points[:, :2],
+                )
+                clearance_limit = float(getattr(Config, "MPC_DANGER_SEGMENT_CLEARANCE", 0.35))
+                hard_clearance = float(getattr(Config, "MPC_DANGER_SEGMENT_HARD_CLEARANCE", 0.08))
+                risk_weight = float(getattr(Config, "MPC_DANGER_SEGMENT_RISK_WEIGHT", 8.0))
+                hard_penalty = float(getattr(Config, "MPC_DANGER_SEGMENT_HARD_PENALTY", 40.0))
+                risk_gap = torch.clamp(clearance_limit - clearances, min=0.0)
+                hard_gap = torch.clamp(hard_clearance - clearances, min=0.0)
+                scores = scores + risk_weight * risk_gap * risk_gap + hard_penalty * hard_gap
+
+            best_local = torch.argmin(scores)
             best_idx = int(pending_idx[best_local].item())
             target_rpos[b] = parsed.waypoint_rpos[b, best_idx]
             target_slot[b] = best_idx
@@ -322,11 +384,190 @@ class RuleMPCController:
     def _update_target_lock(self, parsed, target_rpos: torch.Tensor, target_slot: torch.Tensor, hover_mask: torch.Tensor):
         del parsed, target_rpos, hover_mask
         self._locked_target_slot.copy_(target_slot)
-        self._wp_hold_counter.zero_()
 
-    def _solve_axis(self, controller: LinearAxisMPC, position_error: float, velocity_world: float, prev_u: float):
+    def _build_dangerous_waypoint_mask(self, parsed, target_slot: torch.Tensor):
+        danger_mask = torch.zeros(parsed.batch_size, dtype=torch.bool, device=parsed.device)
+        if not getattr(Config, "MPC_DANGER_WP_ENABLE", True):
+            return danger_mask
+
+        clearance_limit = float(getattr(Config, "MPC_DANGER_WP_CLEARANCE", 0.25))
+        for b in range(parsed.batch_size):
+            slot = int(target_slot[b].item())
+            if slot < 0 or slot >= parsed.waypoint_rpos.shape[1]:
+                continue
+            if not parsed.waypoint_active[b, slot]:
+                continue
+
+            active_obs = parsed.obstacle_active[b]
+            if not active_obs.any():
+                continue
+
+            wp_xy = parsed.waypoint_rpos[b, slot, :2]
+            obs_xy = parsed.obstacle_rpos[b, active_obs, :2]
+            obs_radius = parsed.obstacle_radius[b, active_obs]
+            clearance = torch.norm(obs_xy - wp_xy.unsqueeze(0), dim=-1) - obs_radius
+            danger_mask[b] = torch.min(clearance) < clearance_limit
+
+        return danger_mask
+
+    def _hold_recent_dangerous_waypoint(
+        self,
+        parsed,
+        target_rpos: torch.Tensor,
+        target_slot: torch.Tensor,
+        hover_mask: torch.Tensor,
+        v_world: torch.Tensor,
+    ):
+        prev_slot = self._last_target_slot.clone()
+        prev_danger = self._build_dangerous_waypoint_mask(parsed, prev_slot)
+        changed_from_danger = (prev_slot >= 0) & prev_danger & (target_slot != prev_slot) & (~hover_mask)
+        if not changed_from_danger.any():
+            return target_rpos, target_slot, prev_danger, torch.zeros_like(changed_from_danger)
+
+        stop_speed = float(getattr(Config, "MPC_DANGER_WP_STOP_SPEED", 0.08))
+        hold_frames = max(int(getattr(Config, "MPC_DANGER_WP_HOLD_FRAMES", 8)), 0)
+        speed_xy = torch.norm(v_world[:, :2], dim=-1)
+        hold_mask = changed_from_danger & (
+            (speed_xy > stop_speed) | (self._wp_hold_counter < hold_frames)
+        )
+        if not hold_mask.any():
+            return target_rpos, target_slot, prev_danger, hold_mask
+
+        target_held = target_rpos.clone()
+        slot_held = target_slot.clone()
+        for b in hold_mask.nonzero(as_tuple=False).view(-1):
+            b_idx = int(b.item())
+            slot = int(prev_slot[b_idx].item())
+            target_held[b_idx] = parsed.waypoint_rpos[b_idx, slot]
+            slot_held[b_idx] = slot
+        self._wp_hold_counter[hold_mask] += 1
+        return target_held, slot_held, prev_danger, hold_mask
+
+    def _solve_axis(
+        self,
+        controller: LinearAxisMPC,
+        position_error: float,
+        velocity_world: float,
+        prev_u: float,
+        ref_vel: float = 0.0,
+    ):
         x0 = np.array([position_error, velocity_world], dtype=np.float64)
-        return controller.solve(x0=x0, u_prev=prev_u, ref_pos=0.0, ref_vel=0.0)
+        return controller.solve(x0=x0, u_prev=prev_u, ref_pos=0.0, ref_vel=ref_vel)
+
+    def _build_reference_velocity(
+        self,
+        parsed,
+        target_rpos: torch.Tensor,
+        target_slot: torch.Tensor,
+        hover_mask: torch.Tensor,
+        yaw_align_mask: torch.Tensor,
+        avoid_mask: torch.Tensor,
+        near_goal_mask: torch.Tensor,
+        dangerous_wp_mask: torch.Tensor,
+        dangerous_segment_mask: torch.Tensor,
+    ):
+        ref_vel = torch.zeros_like(target_rpos)
+        if not getattr(Config, "MPC_WP_PASS_THROUGH_ENABLE", True):
+            return ref_vel
+
+        wp_mask = (
+            (target_slot >= 0)
+            & (~hover_mask)
+            & (~yaw_align_mask)
+            & (~avoid_mask)
+            & (~near_goal_mask)
+            & (~dangerous_wp_mask)
+        )
+        if not wp_mask.any():
+            return ref_vel
+
+        dist_xy = torch.norm(target_rpos[:, :2], dim=-1)
+        dist = torch.norm(target_rpos, dim=-1)
+        changed_target = target_slot != self._last_target_slot
+        refresh_segment = wp_mask & (changed_target | (self._segment_length <= 1.0e-4) | (dist > self._segment_length))
+        self._segment_length[refresh_segment] = dist[refresh_segment].clamp_min(0.20)
+
+        segment_len = torch.maximum(self._segment_length, dist).clamp_min(0.20)
+        progress = torch.clamp(1.0 - dist / segment_len, 0.0, 1.0)
+
+        accel_frac = max(float(getattr(Config, "MPC_WP_PROFILE_ACCEL_FRAC", 0.25)), 1.0e-3)
+        decel_frac = max(float(getattr(Config, "MPC_WP_PROFILE_DECEL_FRAC", 0.25)), 1.0e-3)
+        finish_frac = float(getattr(Config, "MPC_WP_PROFILE_FINISH_SPEED_FRAC", 0.32))
+
+        accel_scale = torch.clamp(progress / accel_frac, 0.0, 1.0)
+        decel_dist = (segment_len * decel_frac).clamp_min(1.0e-3)
+        decel_scale = finish_frac + (1.0 - finish_frac) * torch.clamp(dist / decel_dist, 0.0, 1.0)
+        speed_scale = torch.minimum(accel_scale, decel_scale)
+
+        speed_base = float(getattr(Config, "MPC_WP_PROFILE_MAX_SPEED_BASE", 0.45))
+        speed_gain = float(getattr(Config, "MPC_WP_PROFILE_MAX_SPEED_GAIN", 0.42))
+        speed_cap = float(getattr(Config, "MPC_WP_PROFILE_MAX_SPEED_CAP", 1.35))
+        min_speed = float(getattr(Config, "MPC_WP_PROFILE_MIN_SPEED", 0.28))
+        max_speed = torch.clamp(speed_base + speed_gain * segment_len, min=min_speed, max=speed_cap)
+
+        direction = target_rpos / dist.unsqueeze(-1).clamp_min(1.0e-6)
+        if getattr(Config, "MPC_WP_PREVIEW_ENABLE", True):
+            preview_mask = wp_mask & (~dangerous_segment_mask)
+            direction = self._blend_next_waypoint_direction(parsed, direction, target_rpos, target_slot, dist, preview_mask)
+
+        active = wp_mask & (dist > 0.05)
+        ref_vel[active] = direction[active] * (max_speed[active] * speed_scale[active]).unsqueeze(-1)
+
+        if getattr(Config, "MPC_WP_Z_SYNC_ENABLE", True):
+            z_speed_max = float(getattr(Config, "MPC_WP_Z_REF_SPEED_MAX", 0.85))
+            ref_vel[:, 2] = torch.clamp(ref_vel[:, 2], -z_speed_max, z_speed_max)
+
+            near_xy = float(getattr(Config, "MPC_WP_Z_NEAR_XY_DIST", 0.25))
+            near_z = float(getattr(Config, "MPC_WP_Z_NEAR_ERR", 0.12))
+            xy_scale = float(getattr(Config, "MPC_WP_Z_NEAR_XY_SPEED_SCALE", 0.35))
+            z_lag_mask = active & (dist_xy < near_xy) & (torch.abs(target_rpos[:, 2]) > near_z)
+            ref_vel[z_lag_mask, :2] *= xy_scale
+        return ref_vel
+
+    def _blend_next_waypoint_direction(
+        self,
+        parsed,
+        current_dir: torch.Tensor,
+        target_rpos: torch.Tensor,
+        target_slot: torch.Tensor,
+        dist: torch.Tensor,
+        wp_mask: torch.Tensor,
+    ):
+        blended = current_dir.clone()
+        preview_dist = float(getattr(Config, "MPC_WP_PREVIEW_DIST", 0.55))
+        blend_max = float(getattr(Config, "MPC_WP_PREVIEW_BLEND_MAX", 0.28))
+        min_next_dist = float(getattr(Config, "MPC_WP_PREVIEW_MIN_NEXT_DIST", 0.20))
+
+        preview_mask = wp_mask & (dist < preview_dist) & (dist > 0.05)
+        for b in preview_mask.nonzero(as_tuple=False).view(-1):
+            b_idx = int(b.item())
+            pending = parsed.waypoint_active[b_idx] & (~parsed.waypoint_visited[b_idx])
+            current_slot = int(target_slot[b_idx].item())
+            if 0 <= current_slot < pending.shape[0]:
+                pending[current_slot] = False
+            pending_idx = pending.nonzero(as_tuple=False).view(-1)
+            if pending_idx.numel() == 0:
+                continue
+
+            current_target_abs = target_rpos[b_idx]
+            next_rel_from_drone = parsed.waypoint_rpos[b_idx, pending_idx]
+            next_rel_from_target = next_rel_from_drone - current_target_abs.unsqueeze(0)
+            next_dist = torch.norm(next_rel_from_target, dim=-1)
+            valid = next_dist > min_next_dist
+            if not valid.any():
+                continue
+
+            valid_idx = pending_idx[valid]
+            valid_vec = next_rel_from_target[valid]
+            valid_dist = next_dist[valid]
+            next_vec = valid_vec[torch.argmin(valid_dist)]
+            next_dir = next_vec / torch.norm(next_vec).clamp_min(1.0e-6)
+
+            blend = blend_max * torch.clamp((preview_dist - dist[b_idx]) / max(preview_dist, 1.0e-6), 0.0, 1.0)
+            mixed = current_dir[b_idx] * (1.0 - blend) + next_dir * blend
+            blended[b_idx] = mixed / torch.norm(mixed).clamp_min(1.0e-6)
+
+        return blended
 
     def _apply_startup_guard(self, target_rpos: torch.Tensor, hover_mask: torch.Tensor):
         target_guarded = target_rpos.clone()
@@ -735,9 +976,24 @@ class RuleMPCController:
         roll, pitch, yaw = self._extract_attitude(rotation)
 
         raw_target_rpos, target_slot, hover_mask = self._select_local_target(parsed)
+        raw_target_rpos, target_slot, previous_dangerous_wp_mask, danger_hold_mask = (
+            self._hold_recent_dangerous_waypoint(
+                parsed,
+                raw_target_rpos,
+                target_slot,
+                hover_mask,
+                v_world,
+            )
+        )
+        dangerous_wp_mask = self._build_dangerous_waypoint_mask(parsed, target_slot)
+        dangerous_segment_mask = self._build_dangerous_segment_mask(parsed, raw_target_rpos, target_slot)
         near_goal_mask = self._build_goal_hover_mask(parsed, hover_mask, v_world)
         changed_target = target_slot != self._last_target_slot
-        self._prev_u[changed_target] = 0.0
+        waypoint_to_waypoint = changed_target & (self._last_target_slot >= 0) & (target_slot >= 0)
+        hard_reset_target = changed_target & (
+            (~waypoint_to_waypoint) | dangerous_wp_mask | previous_dangerous_wp_mask
+        )
+        self._prev_u[hard_reset_target] = 0.0
         self._wp_hold_counter[changed_target] = 0
         target_rpos, xy_scale, z_scale, high_z_mask = self._apply_startup_guard(raw_target_rpos, hover_mask)
         low_alt_mask, strong_takeoff_mask, current_up, xy_accel_limit, tilt_limit, takeoff_progress = (
@@ -758,6 +1014,17 @@ class RuleMPCController:
             yaw_align_mask,
             v_world,
         )
+        ref_vel = self._build_reference_velocity(
+            parsed,
+            target_rpos,
+            target_slot,
+            hover_mask,
+            yaw_align_mask,
+            avoid_mask,
+            near_goal_mask,
+            dangerous_wp_mask,
+            dangerous_segment_mask,
+        )
 
         accel_cmd = torch.zeros(parsed.batch_size, 3, device=parsed.device, dtype=torch.float32)
         for b in range(parsed.batch_size):
@@ -769,18 +1036,21 @@ class RuleMPCController:
                 position_error=float(target_rpos[b, 0].item()),
                 velocity_world=float(v_world[b, 0].item()),
                 prev_u=float(self._prev_u[b, 0].item()),
+                ref_vel=float(ref_vel[b, 0].item()),
             )
             y_result = self._solve_axis(
                 controller=xy_controller,
                 position_error=float(target_rpos[b, 1].item()),
                 velocity_world=float(v_world[b, 1].item()),
                 prev_u=float(self._prev_u[b, 1].item()),
+                ref_vel=float(ref_vel[b, 1].item()),
             )
             z_result = self._solve_axis(
                 controller=z_controller,
                 position_error=float(target_rpos[b, 2].item()),
                 velocity_world=float(v_world[b, 2].item()),
                 prev_u=float(self._prev_u[b, 2].item()),
+                ref_vel=float(ref_vel[b, 2].item()),
             )
 
             accel_cmd[b, 0] = x_result.command.to(parsed.device)
@@ -855,9 +1125,12 @@ class RuleMPCController:
                 f"up={current_up[b0]:+.2f} "
                 f"lowalt={int(low_alt_mask[b0].item())} "
                 f"yalign={int(yaw_align_mask[b0].item())} "
+                f"danger_wp={int(dangerous_wp_mask[b0].item())}/{int(danger_hold_mask[b0].item())} "
+                f"danger_seg={int(dangerous_segment_mask[b0].item())} "
                 f"yaw={yaw[b0]:+.2f} "
                 f"avoid={int(avoid_mask[b0].item())}:{int(avoid_slot[b0].item())}/{float(avoid_side[b0].item()):+.0f} "
                 f"emg={int(emergency_mask[b0].item())} "
+                f"vref=({ref_vel[b0,0]:+.2f},{ref_vel[b0,1]:+.2f},{ref_vel[b0,2]:+.2f}) "
                 f"tprog={takeoff_progress[b0]:.2f} "
                 f"gnear={int(near_goal_mask[b0].item())} "
                 f"v=({v_world[b0,0]:+.2f},{v_world[b0,1]:+.2f},{v_world[b0,2]:+.2f}) "
