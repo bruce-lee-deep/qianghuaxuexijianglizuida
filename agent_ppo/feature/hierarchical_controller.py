@@ -28,7 +28,7 @@ class HierarchicalController:
 
     def __init__(self, logger=None):
         self.logger = logger
-        self.parser = ObservationParser()
+        self.parser = ObservationParser() 
         self.waypoint_seq = WaypointSequencer()
         self.planner = PotentialFieldPlanner()
         self.vel_ctrl = VelocityController()

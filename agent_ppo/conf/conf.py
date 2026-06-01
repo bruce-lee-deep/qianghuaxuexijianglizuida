@@ -99,8 +99,10 @@ class Config:
     MPC_TAKEOFF_STRONG_TILT_RAD = 0.026
     MPC_TAKEOFF_XY_SLEW_LIMIT = 0.035
     MPC_XY_SLEW_LIMIT = 0.55
+    MPC_XY_SLEW_LIMIT_DENSE = 0.37125
     MPC_TAKEOFF_Z_SLEW_LIMIT = 0.30375
     MPC_Z_SLEW_LIMIT = 0.85
+    MPC_Z_SLEW_LIMIT_DENSE = 0.675
     MPC_HOVER_THRUST_BIAS = 0.0
     MPC_STARTUP_THRUST_BIAS = 0.012
     MPC_VZ_DAMP = 0.14
@@ -109,6 +111,7 @@ class Config:
     MPC_GOAL_BIAS_DIST_XY = 0.35
     MPC_GOAL_BIAS_DIST_Z = 0.25
     MPC_GOAL_BIAS_SPEED_XY = 0.30
+    MPC_GOAL_BIAS_SPEED_XY_DENSE = 0.24
     MPC_WP_REACHED_XY = 0.18
     MPC_WP_REACHED_Z = 0.20
     MPC_WP_REACHED_SPEED_XY = 0.30
@@ -121,6 +124,7 @@ class Config:
     MPC_WP_PROFILE_ACCEL_FRAC = 0.25
     MPC_WP_PROFILE_DECEL_FRAC = 0.25
     MPC_WP_PROFILE_FINISH_SPEED_FRAC = 0.32
+    MPC_WP_PROFILE_FINAL_FINISH_SPEED_FRAC = 0.60  # final waypoint: carry momentum toward goal
     MPC_WP_PREVIEW_ENABLE = True
     MPC_WP_PREVIEW_DIST = 0.55
     MPC_WP_PREVIEW_BLEND_MAX = 0.22
@@ -140,20 +144,125 @@ class Config:
     MPC_DANGER_SEGMENT_RISK_WEIGHT = 8.0
     MPC_DANGER_SEGMENT_HARD_PENALTY = 40.0
 
+    # ---------------------------------------------------------------------------
+    # Dense-obstacle (3+) MPC: danger / critical / late-waypoint logic
+    # ---------------------------------------------------------------------------
+    MPC_CRITICAL_WP_CLEARANCE = 0.10
+    MPC_DANGER_WP_CLEARANCE_DENSE = 0.35
+    MPC_DANGER_WP_APPROACH_SPEED_SCALE = 0.75
+    MPC_DANGER_WP_BRAKE_DIST_FRAC = 0.33
+    MPC_DANGER_WP_BRAKE_ACCEL_SCALE = 1.15
+    MPC_DANGER_SEGMENT_SPEED_SCALE = 0.55
+    MPC_SAFE_SEGMENT_SPEED_SCALE = 1.40
+    MPC_LATE_WP_SAFE_FRAME = 1050
+    MPC_FORCE_GOAL_FRAME = 1200
+    MPC_SKIP_START_SIDE_FRAME = 950
+    MPC_SKIP_START_SIDE_X = 2.0
+    MPC_LATE_WP_ROUTE_EXTRA = 0.60
+    MPC_LATE_WP_ROUTE_OVERSHOOT = 0.20
+
+    # Dense-obstacle (3+) MPC: post-danger segment guard
+    MPC_POST_DANGER_SEGMENT_GUARD_FRAMES = 45
+    MPC_POST_DANGER_SEGMENT_CLEARANCE = 0.45
+    MPC_POST_DANGER_SEGMENT_SPEED_SCALE = 0.45
+
+    # Dense-obstacle (3+) MPC: segment detour avoidance
+    MPC_SEGMENT_DETOUR_ENABLE = True
+    MPC_SEGMENT_DETOUR_CLEARANCE = 0.35
+    MPC_SEGMENT_DETOUR_EXTRA_MARGIN = 0.10
+    MPC_SEGMENT_DETOUR_ADVANCE = 0.25
+    MPC_SEGMENT_DETOUR_HOLD_FRAMES = 28
+    MPC_SEGMENT_DETOUR_RADIUS_SCALES = [1.0, 1.35, 1.70]
+
+    # Dense-obstacle (3+) MPC: hard safety (accel-level override)
+    MPC_HARD_SAFETY_ENABLE = True
+    MPC_HARD_SAFETY_CLEARANCE = 0.18
+    MPC_HARD_SAFETY_RELEASE_CLEARANCE = 0.26
+    MPC_HARD_SAFETY_AWAY_ACCEL = 2.4
+    MPC_HARD_SAFETY_BRAKE_GAIN = 1.8
+    MPC_HARD_SAFETY_MAX_ACCEL = 2.6
+
+    # Dense-obstacle (3+) MPC: speed brake system
+    MPC_SPEED_BRAKE_ENABLE = True
+    MPC_SPEED_BRAKE_DECEL = 1.8
+    MPC_SPEED_BRAKE_BUFFER = 0.18
+    MPC_SPEED_BRAKE_DIST_MIN = 0.35
+    MPC_SPEED_BRAKE_GAIN = 1.35
+    MPC_SPEED_BRAKE_MAX_ACCEL = 1.8
+    MPC_SPEED_BRAKE_NEAR_OBS_CLEARANCE = 0.65
+    MPC_SPEED_BRAKE_NEAR_OBS_SPEED = 0.25
+    MPC_SPEED_BRAKE_SAFE_SPEED = 0.55
+
+    # Dense-obstacle (3+) MPC: goal-directed speed management
+    MPC_GOAL_SPEED_ENABLE = True
+    MPC_GOAL_FAST_DIST = 0.60
+    MPC_GOAL_BRAKE_DIST = 0.45
+    MPC_GOAL_PRECISE_DIST = 0.30
+    MPC_GOAL_FAST_SPEED_SCALE = 1.25
+    MPC_GOAL_BRAKE_SPEED_SCALE = 0.28
+
     # Local cylindrical obstacle avoidance. Cylinders are full-height, so avoid in x-y.
     OBSTACLE_AVOID_ENABLE = True
     OBSTACLE_LOOKAHEAD_MIN = 0.05
-    OBSTACLE_LOOKAHEAD_MAX = 1.00
+    OBSTACLE_LOOKAHEAD_MAX = 1.35
+    OBSTACLE_LOOKAHEAD_MAX_DENSE = 1.00
     OBSTACLE_NORMAL_TRIGGER_MIN = 0.60
     OBSTACLE_BASE_MARGIN = 0.26
     OBSTACLE_SPEED_MARGIN_GAIN = 0.14
+    OBSTACLE_SPEED_MARGIN_GAIN_DENSE = 0.08
     OBSTACLE_DETOUR_MARGIN = 0.42
     OBSTACLE_DETOUR_ADVANCE = 0.45
     OBSTACLE_AVOID_HOLD_FRAMES = 30
+    OBSTACLE_AVOID_HOLD_FRAMES_DENSE = 18
     OBSTACLE_WALL_MARGIN = 0.32
-    OBSTACLE_EMERGENCY_MARGIN = 0.32
+    OBSTACLE_EMERGENCY_MARGIN = 0.40
+    OBSTACLE_EMERGENCY_MARGIN_DENSE = 0.24
     OBSTACLE_EMERGENCY_GAIN = 2.2
     OBSTACLE_EMERGENCY_ACCEL_MAX = 1.8
+    OBSTACLE_EMERGENCY_Z_CLIMB_GAIN = 0.25
+
+    # Tangential force for obstacle avoidance (slides around obstacles).
+    OBSTACLE_TANGENTIAL_GAIN = 0.65
+    OBSTACLE_TANGENTIAL_MAX = 1.2
+
+    # Arena boundary repulsion (prevents wall collisions in enclosed space).
+    BOUNDARY_REPULSION_ENABLE = True
+    BOUNDARY_REPULSION_MARGIN = 0.35
+    BOUNDARY_REPULSION_GAIN = 2.5
+
+    # Tangential direction lock (prevents figure-8 oscillation between obstacles).
+    TAN_DIR_LOCK_ENABLE = True
+    TAN_DIR_LOCK_MIN_FRAMES = 8
+
+    # Attraction-source transition: smooth blend from detour back to original target.
+    OBSTACLE_AVOID_TRANSITION_ENABLE = True
+    OBSTACLE_AVOID_TRANSITION_BLEND = 0.55
+    OBSTACLE_AVOID_TRANSITION_DIST = 0.70
+
+    # Obstacle-avoidance hold persistence (prevent premature snap-back).
+    OBSTACLE_AVOID_HOLD_FRAMES_MAX = 60
+    OBSTACLE_AVOID_CASCADE_DEPTH = 2
+
+    # Wall-aware detour scoring (prevents choosing detour paths into boundaries).
+    OBSTACLE_DETOUR_WALL_PENALTY = 15.0
+
+    # Trap escape: when drone is pinned between obstacle and wall.
+    OBSTACLE_TRAP_ESCAPE_GAIN = 1.5
+
+    # Binary Tide boundary override (last-resort wall protection).
+    BINARY_TIDE_BOUNDARY_ENABLE = True
+    BINARY_TIDE_BOUNDARY_GAIN = 2.5
+
+    # Binary Tide hard safety override (last-resort action replacement).
+    BINARY_TIDE_ENABLE = True
+    BINARY_TIDE_MARGIN = 0.15
+    BINARY_TIDE_THRUST_BOOST = 0.08
+    BINARY_TIDE_LATERAL_GAIN = 2.0
+    BINARY_TIDE_CLIMB_ACCEL = 3.0
+    BINARY_TIDE_BRAKE_GAIN = 0.5
+    BINARY_TIDE_HOLD_FRAMES = 6
+    BINARY_TIDE_MAX_ROLL_RATE = 0.95
+    BINARY_TIDE_MAX_PITCH_RATE = 0.95
 
     # Startup yaw alignment: hover/rise first, rotate nose to +x, then lock yaw.
     MPC_YAW_ALIGN_ENABLE = True
